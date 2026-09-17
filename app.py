@@ -42,11 +42,34 @@ def password_hash(password: str) -> str:
 
 
 def is_admin(user: dict) -> bool:
-    return str(user.get("role", "")).strip().lower() == "admin"
+    return str(user.get("role", "")).strip().lower() in {"admin", "super_admin"}
+
+
+def is_super_admin(user: dict) -> bool:
+    return str(user.get("role", "")).strip().lower() == "super_admin"
+
+
+def active_pharmacy_id() -> int | None:
+    if "user" not in st.session_state:
+        return None
+    return st.session_state.user.get("pharmacy_id")
+
+
+def write_pharmacy_id() -> int | None:
+    if is_super_admin(st.session_state.get("user", {})):
+        return st.session_state.get("selected_pharmacy_id")
+    return active_pharmacy_id()
+
+
+def pharmacy_scope(alias: str = "") -> tuple[str, tuple]:
+    if is_super_admin(st.session_state.get("user", {})):
+        return "", ()
+    column = f"{alias}.pharmacy_id" if alias else "pharmacy_id"
+    return f" WHERE {column}=?", (active_pharmacy_id(),)
 
 
 def authenticate(username: str, password: str) -> sqlite3.Row | None:
-    rows = query("SELECT * FROM users WHERE username=? AND password_hash=? AND active=1", (username.strip(), password_hash(password)))
+    rows = query("SELECT u.*, p.name AS pharmacy_name FROM users u LEFT JOIN pharmacies p ON p.id=u.pharmacy_id WHERE u.username=? AND u.password_hash=? AND u.active=1", (username.strip(), password_hash(password)))
     return rows[0] if rows else None
 
 
@@ -58,6 +81,11 @@ def setup_database() -> None:
     with db() as connection:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS pharmacies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE, location TEXT DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS suppliers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE, contact_person TEXT DEFAULT '', phone TEXT DEFAULT '',
@@ -96,10 +124,21 @@ def setup_database() -> None:
             );
             """
         )
+        default_pharmacy = connection.execute("SELECT id FROM pharmacies ORDER BY id LIMIT 1").fetchone()
+        if default_pharmacy is None:
+            connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?)", ("Eashers Pharmacy", "Ruiru Town, Kiambu", now_text()))
+            default_pharmacy = connection.execute("SELECT id FROM pharmacies ORDER BY id LIMIT 1").fetchone()
+        default_pharmacy_id = default_pharmacy[0]
+        for table in ("suppliers", "products", "sales", "audit_log", "users"):
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "pharmacy_id" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN pharmacy_id INTEGER")
+            connection.execute(f"UPDATE {table} SET pharmacy_id=? WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
+        connection.execute("UPDATE users SET role='super_admin', pharmacy_id=NULL WHERE username='Stephen'")
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             connection.execute(
-                "INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                ("Stephen", password_hash("Stephen@12k"), "admin", 1, 1, 1, 1, now_text()),
+                "INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("Stephen", password_hash("Stephen@12k"), "super_admin", 1, 1, 1, 1, now_text(), None),
             )
         if connection.execute("SELECT COUNT(*) FROM suppliers").fetchone()[0] == 0:
             suppliers = [
@@ -120,6 +159,8 @@ def setup_database() -> None:
             ]
             connection.executemany("INSERT INTO products(product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [row + (now_text(), now_text()) for row in products])
             connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at) VALUES(?,?,?,?,?)", ("Initial setup", "Inventory", "Seeded starter pharmacy inventory", "System", now_text()))
+        for table in ("suppliers", "products", "sales", "audit_log"):
+            connection.execute(f"UPDATE {table} SET pharmacy_id=? WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
 
 
 def query(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -129,11 +170,12 @@ def query(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 
 def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admin") -> None:
     with db() as connection:
-        connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at) VALUES(?,?,?,?,?)", (action, entity, details, user, now_text()))
+        connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, now_text(), write_pharmacy_id()))
 
 
 def load_products() -> pd.DataFrame:
-    return pd.read_sql_query("SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id ORDER BY p.name", db())
+    where, params = pharmacy_scope("p")
+    return pd.read_sql_query(f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name", db(), params=params)
 
 
 def inventory_excel_bytes() -> bytes:
@@ -273,19 +315,19 @@ def import_inventory_excel(content: bytes, performed_by: str) -> tuple[int, int]
     with db() as connection:
         for row in uploaded.to_dict("records"):
             supplier_name = "Unassigned" if pd.isna(row["Supplier Name"]) else str(row["Supplier Name"]).strip() or "Unassigned"
-            supplier = connection.execute("SELECT id FROM suppliers WHERE name=?", (supplier_name,)).fetchone()
+            supplier = connection.execute("SELECT id FROM suppliers WHERE name=? AND pharmacy_id=?", (supplier_name, write_pharmacy_id())).fetchone()
             if not supplier:
-                supplier = connection.execute("INSERT INTO suppliers(name,created_at) VALUES(?,?)", (supplier_name, now_text()))
+                supplier = connection.execute("INSERT INTO suppliers(name,created_at,pharmacy_id) VALUES(?,?,?)", (supplier_name, now_text(), write_pharmacy_id()))
                 supplier_id = supplier.lastrowid
             else:
                 supplier_id = supplier["id"]
             values = (row["Product Name"], "Medicine", supplier_id, row["Batch No"] or "N/A", row["Expiry Date"], row["Initial Stock"], row["QTY Sold"], row["Current Stock"], row["Reorder Level"], row["Unit Cost (KSh)"], row["Selling Price (KSh)"], now_text(), row["Product ID"])
-            existing = connection.execute("SELECT id FROM products WHERE product_code=?", (row["Product ID"],)).fetchone()
+            existing = connection.execute("SELECT id FROM products WHERE product_code=? AND pharmacy_id=?", (row["Product ID"], write_pharmacy_id())).fetchone()
             if existing:
-                connection.execute("UPDATE products SET name=?,category=?,supplier_id=?,batch_no=?,expiry_date=?,initial_stock=?,quantity_sold=?,current_stock=?,reorder_level=?,unit_cost=?,selling_price=?,updated_at=? WHERE product_code=?", values)
+                connection.execute("UPDATE products SET name=?,category=?,supplier_id=?,batch_no=?,expiry_date=?,initial_stock=?,quantity_sold=?,current_stock=?,reorder_level=?,unit_cost=?,selling_price=?,updated_at=? WHERE product_code=? AND pharmacy_id=?", values + (write_pharmacy_id(),))
                 updated += 1
             else:
-                connection.execute("INSERT INTO products(name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,updated_at,product_code,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values[:-1] + (row["Product ID"], now_text()))
+                connection.execute("INSERT INTO products(name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,updated_at,product_code,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values[:-1] + (row["Product ID"], now_text(), write_pharmacy_id()))
                 inserted += 1
     add_audit("Inventory Excel imported", "Inventory", f"Accepted {inserted} new and {updated} updated rows", performed_by)
     return inserted, updated
@@ -304,7 +346,7 @@ def expiry_status(value: str | None) -> str:
 
 def add_product(data: dict) -> None:
     with db() as connection:
-        connection.execute("INSERT INTO products(product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (data["code"], data["name"], data["category"], data["supplier_id"], data["batch"], data["expiry"], data["stock"], data["stock"], data["reorder"], data["cost"], data["price"], now_text(), now_text()))
+        connection.execute("INSERT INTO products(product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (data["code"], data["name"], data["category"], data["supplier_id"], data["batch"], data["expiry"], data["stock"], data["stock"], data["reorder"], data["cost"], data["price"], now_text(), now_text(), write_pharmacy_id()))
     add_audit("Product added", "Inventory", f"Added {data['code']} - {data['name']}")
 
 
@@ -314,7 +356,7 @@ def create_sale(cart: list[dict], customer: str, payment: str, discount: float, 
     current_time = datetime.now(EAT)
     receipt = f"POS-{current_time:%Y%m%d}-{current_time.microsecond // 1000:03d}"
     with db() as connection:
-        sale_id = connection.execute("INSERT INTO sales(receipt_no,customer_name,payment_method,subtotal,discount,total,cashier,created_at) VALUES(?,?,?,?,?,?,?,?)", (receipt, customer, payment, subtotal, discount, total, cashier, now_text())).lastrowid
+        sale_id = connection.execute("INSERT INTO sales(receipt_no,customer_name,payment_method,subtotal,discount,total,cashier,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (receipt, customer, payment, subtotal, discount, total, cashier, now_text(), write_pharmacy_id())).lastrowid
         for item in cart:
             connection.execute("INSERT INTO sale_items(sale_id,product_id,quantity,unit_price,line_total) VALUES(?,?,?,?,?)", (sale_id, item["id"], item["quantity"], item["unit_price"], item["quantity"] * item["unit_price"]))
             connection.execute("UPDATE products SET current_stock=current_stock-?, quantity_sold=quantity_sold+?, updated_at=? WHERE id=?", (item["quantity"], item["quantity"], now_text(), item["id"]))
@@ -341,12 +383,17 @@ if "user" not in st.session_state:
         authenticated = authenticate(username, password)
         if authenticated:
             st.session_state.user = dict(authenticated)
+            st.session_state.selected_pharmacy_id = authenticated["pharmacy_id"]
             st.rerun()
         st.error("Invalid username or password.")
     st.stop()
 
 current_user = st.session_state.user
 admin_access = is_admin(current_user)
+if is_super_admin(current_user) and st.session_state.get("selected_pharmacy_id") is None:
+    first_pharmacy = query("SELECT id FROM pharmacies WHERE active=1 ORDER BY name LIMIT 1")
+    if first_pharmacy:
+        st.session_state.selected_pharmacy_id = first_pharmacy[0]["id"]
 st_autorefresh(interval=10000, limit=None, key="realtime_refresh")
 
 st.markdown("""
@@ -370,9 +417,17 @@ with st.sidebar:
     allowed_pages = ["Dashboard", "Point of Sale", "Daily Sales", "Inventory & Stock", "Suppliers", "Audit Log"]
     if admin_access:
         allowed_pages.append("Members")
+    if is_super_admin(current_user):
+        allowed_pages.append("Pharmacies")
     page = st.radio("Navigate", allowed_pages, label_visibility="collapsed")
     st.divider()
-    st.caption(f"Signed in: {current_user['username']} · {current_user['role'].title()}")
+    if is_super_admin(current_user):
+        pharmacy_options = query("SELECT id,name FROM pharmacies WHERE active=1 ORDER BY name")
+        selected_name = st.selectbox("Manage pharmacy", [row["name"] for row in pharmacy_options], index=next((index for index, row in enumerate(pharmacy_options) if row["id"] == st.session_state.selected_pharmacy_id), 0))
+        st.session_state.selected_pharmacy_id = next(row["id"] for row in pharmacy_options if row["name"] == selected_name)
+    pharmacy_label = "All pharmacies" if is_super_admin(current_user) else current_user.get("pharmacy_name", "Assigned pharmacy")
+    st.caption(f"Signed in: {current_user['username']} · {current_user['role'].replace('_', ' ').title()}")
+    st.caption(f"Scope: {pharmacy_label}")
     st.caption(f"Live sync: {now_text()} EAT")
     if st.button("Sign out", use_container_width=True):
         del st.session_state["user"]
@@ -387,7 +442,8 @@ products = load_products()
 
 if page == "Dashboard":
     header("Executive view", "A clearer shelf, every day.", "Track stock health, revenue, expiry exposure, and the work that needs attention.")
-    sales = query("SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales WHERE date(created_at)=date('now')")[0]
+    sales_where, sales_params = pharmacy_scope("sales")
+    sales = query(f"SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales{sales_where} AND date(created_at)=date('now')" if sales_where else "SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales WHERE date(created_at)=date('now')", sales_params)[0]
     metrics = [("Inventory value", money((products.current_stock * products.unit_cost).sum()), "current stock at cost"), ("Today's revenue", money(sales["total"]), f"{sales['count']} completed sales"), ("Low-stock items", f"{sum(status(r.current_stock, r.reorder_level) == 'LOW STOCK' for r in products.itertuples())}", "need replenishment"), ("Expiry watch", f"{sum(expiry_status(r.expiry_date) in ('EXPIRED','EXPIRING SOON') for r in products.itertuples())}", "expired or within 90 days")]
     columns = st.columns(4)
     for column, (label, value, note) in zip(columns, metrics):
@@ -487,7 +543,8 @@ elif page == "Inventory & Stock":
         product_form = None
     if product_form:
         with product_form:
-            supplier_rows = [dict(row) for row in query("SELECT id,name FROM suppliers ORDER BY name")]
+            supplier_where, supplier_params = pharmacy_scope()
+            supplier_rows = [dict(row) for row in query(f"SELECT id,name FROM suppliers{supplier_where} ORDER BY name", supplier_params)]
             with st.form("new_product"):
                 a, b, c = st.columns(3)
                 with a: code = st.text_input("Product code *"); name = st.text_input("Drug name *"); category = st.text_input("Category", value="Medicine")
@@ -510,7 +567,10 @@ elif page == "Inventory & Stock":
 elif page == "Daily Sales":
     header("Sales intelligence", "Daily sales log.", "Review every transaction, payment method, cashier, and revenue total.")
     selected_date = st.date_input("Sales date", value=date.today())
-    sales = pd.read_sql_query("SELECT receipt_no, created_at, customer_name, payment_method, subtotal, discount, total, cashier FROM sales WHERE date(created_at)=? ORDER BY created_at DESC", db(), params=(selected_date.isoformat(),))
+    sales_where, sales_params = pharmacy_scope("sales")
+    sales_sql = "SELECT receipt_no, created_at, customer_name, payment_method, subtotal, discount, total, cashier FROM sales"
+    sales_sql += sales_where + (" AND " if sales_where else " WHERE ") + "date(created_at)=? ORDER BY created_at DESC"
+    sales = pd.read_sql_query(sales_sql, db(), params=sales_params + (selected_date.isoformat(),))
     st.metric("Revenue", money(sales.total.sum() if not sales.empty else 0)); st.dataframe(sales.rename(columns={"receipt_no":"Receipt","created_at":"Date & time","customer_name":"Customer","payment_method":"Payment","subtotal":"Subtotal","discount":"Discount","total":"Total","cashier":"Cashier"}), use_container_width=True, hide_index=True)
     st.download_button("Export daily sales Excel", dataframe_excel_bytes(sales, "Daily Sales"), f"sales-{selected_date.isoformat()}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -530,17 +590,42 @@ elif page == "Suppliers":
             save_supplier = st.form_submit_button("Add supplier", type="primary")
     if supplier_form and save_supplier:
         try:
-            with db() as connection: connection.execute("INSERT INTO suppliers(name,contact_person,phone,email,lead_time_days,payment_terms,created_at) VALUES(?,?,?,?,?,?,?)", (supplier_name.strip(),contact,phone,email,lead,terms,now_text()))
+            with db() as connection: connection.execute("INSERT INTO suppliers(name,contact_person,phone,email,lead_time_days,payment_terms,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?)", (supplier_name.strip(),contact,phone,email,lead,terms,now_text(),write_pharmacy_id()))
             add_audit("Supplier added", "Suppliers", f"Added {supplier_name.strip()}"); st.success("Supplier added."); st.rerun()
         except sqlite3.IntegrityError: st.error("That supplier already exists.")
-    suppliers = pd.read_sql_query("SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers ORDER BY name", db())
+    suppliers_where, suppliers_params = pharmacy_scope()
+    suppliers = pd.read_sql_query(f"SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers{suppliers_where} ORDER BY name", db(), params=suppliers_params)
     st.dataframe(suppliers.rename(columns={"name":"Supplier","contact_person":"Contact","phone":"Phone","email":"Email","lead_time_days":"Lead days","payment_terms":"Terms"}), use_container_width=True, hide_index=True)
 
 elif page == "Audit Log":
     header("Traceability", "System activity.", "A searchable record of stock, sales, products, and supplier changes.")
-    audit = pd.read_sql_query("SELECT created_at, action_type, entity, details, performed_by FROM audit_log ORDER BY id DESC", db())
+    audit_where, audit_params = pharmacy_scope()
+    audit = pd.read_sql_query(f"SELECT created_at, action_type, entity, details, performed_by FROM audit_log{audit_where} ORDER BY id DESC", db(), params=audit_params)
     st.dataframe(audit.rename(columns={"created_at":"Date & time","action_type":"Action","entity":"Entity","details":"Details","performed_by":"Performed by"}), use_container_width=True, hide_index=True)
     st.download_button("Export audit log Excel", dataframe_excel_bytes(audit, "Audit Log"), "audit-log.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+elif page == "Pharmacies":
+    header("Global administration", "Pharmacy systems.", "Create isolated pharmacy workspaces and assign an administrator to each one.")
+    with st.form("new_pharmacy"):
+        pharmacy_name = st.text_input("Pharmacy name *")
+        pharmacy_location = st.text_input("Location")
+        admin_name = st.text_input("Pharmacy admin username *")
+        admin_password = st.text_input("Pharmacy admin temporary password *", type="password")
+        create_pharmacy = st.form_submit_button("Create pharmacy system", type="primary")
+    if create_pharmacy:
+        if not pharmacy_name.strip() or not admin_name.strip() or not admin_password:
+            st.error("Pharmacy name, admin username, and password are required.")
+        else:
+            try:
+                with db() as connection:
+                    pharmacy_id = connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?)", (pharmacy_name.strip(), pharmacy_location.strip(), now_text())).lastrowid
+                    connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (admin_name.strip(), password_hash(admin_password), "admin", 1, 1, 1, 1, now_text(), pharmacy_id))
+                st.success(f"Created {pharmacy_name.strip()} with admin {admin_name.strip()}.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.error("The pharmacy name or admin username already exists.")
+    pharmacies = pd.read_sql_query("SELECT name,location,active,created_at FROM pharmacies ORDER BY name", db())
+    st.dataframe(pharmacies.rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
 
 elif page == "Members":
     header("Access control", "Team members.", "Create sales-only accounts and grant additional rights only when needed.")
@@ -562,10 +647,11 @@ elif page == "Members":
         else:
             try:
                 with db() as connection:
-                    connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at) VALUES(?,?,?,?,?,?,?,?)", (member_name.strip(), password_hash(member_password), "member", int(manage_inventory), int(manage_suppliers), int(view_reports), int(view_audit), now_text()))
+                    connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (member_name.strip(), password_hash(member_password), "member", int(manage_inventory), int(manage_suppliers), int(view_reports), int(view_audit), now_text(), write_pharmacy_id()))
                 add_audit("Member added", "Users", f"Created member account {member_name.strip()}", current_user["username"])
                 st.success(f"Member {member_name.strip()} created."); st.rerun()
             except sqlite3.IntegrityError:
                 st.error("That username already exists.")
-    members = pd.read_sql_query("SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users ORDER BY username", db())
+    members_where, members_params = pharmacy_scope()
+    members = pd.read_sql_query(f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{members_where} ORDER BY username", db(), params=members_params)
     st.dataframe(members.rename(columns={"username":"Username","role":"Role","active":"Active","can_manage_inventory":"Inventory rights","can_manage_suppliers":"Supplier rights","can_view_reports":"Report rights","can_view_audit":"Audit rights","created_at":"Created"}), use_container_width=True, hide_index=True)
