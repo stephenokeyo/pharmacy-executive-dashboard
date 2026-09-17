@@ -6,6 +6,7 @@ import io
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -15,6 +16,7 @@ from streamlit_autorefresh import st_autorefresh
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "pharmacy.db"
 CURRENCY = "KSh"
+EAT = ZoneInfo("Africa/Nairobi")
 INVENTORY_EXCEL_COLUMNS = [
     "Product ID", "Product Name", "Supplier Name", "Batch No", "Expiry Date", "Initial Stock",
     "QTY Sold", "Current Stock", "Reorder Level", "Unit Cost (KSh)", "Total Cost (KSh)", "Markup %",
@@ -32,7 +34,7 @@ def db() -> sqlite3.Connection:
 
 
 def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(EAT).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def password_hash(password: str) -> str:
@@ -305,7 +307,8 @@ def add_product(data: dict) -> None:
 def create_sale(cart: list[dict], customer: str, payment: str, discount: float, cashier: str) -> tuple[str, float]:
     subtotal = sum(item["quantity"] * item["unit_price"] for item in cart)
     total = max(0, subtotal - discount)
-    receipt = f"POS-{datetime.now():%Y%m%d}-{datetime.now().microsecond // 1000:03d}"
+    current_time = datetime.now(EAT)
+    receipt = f"POS-{current_time:%Y%m%d}-{current_time.microsecond // 1000:03d}"
     with db() as connection:
         sale_id = connection.execute("INSERT INTO sales(receipt_no,customer_name,payment_method,subtotal,discount,total,cashier,created_at) VALUES(?,?,?,?,?,?,?,?)", (receipt, customer, payment, subtotal, discount, total, cashier, now_text())).lastrowid
         for item in cart:
@@ -365,7 +368,7 @@ with st.sidebar:
     page = st.radio("Navigate", allowed_pages, label_visibility="collapsed")
     st.divider()
     st.caption(f"Signed in: {current_user['username']} · {current_user['role'].title()}")
-    st.caption(f"Live sync: {now_text()}")
+    st.caption(f"Live sync: {now_text()} EAT")
     if st.button("Sign out", use_container_width=True):
         del st.session_state["user"]
         st.rerun()
