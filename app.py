@@ -673,7 +673,7 @@ elif page == "Pharmacies":
     st.dataframe(pharmacies.rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
 
 elif page == "Members":
-    header("Access control", "Team members.", "Create sales-only accounts and grant additional rights only when needed.")
+    header("Access control", "Team members.", "Create accounts and manage passwords within the current pharmacy scope.")
     with st.form("new_member"):
         member_left, member_right = st.columns(2)
         with member_left:
@@ -700,3 +700,25 @@ elif page == "Members":
     members_where, members_params = pharmacy_scope()
     members = pd.read_sql_query(f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{members_where} ORDER BY username", db(), params=members_params)
     st.dataframe(members.rename(columns={"username":"Username","role":"Role","active":"Active","can_manage_inventory":"Inventory rights","can_manage_suppliers":"Supplier rights","can_view_reports":"Report rights","can_view_audit":"Audit rights","created_at":"Created"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Reset a user password")
+    reset_where, reset_params = pharmacy_scope("u")
+    reset_users = query(f"SELECT u.id, u.username, u.role FROM users u{reset_where} ORDER BY u.username", reset_params)
+    reset_users = [row for row in reset_users if row["username"] != current_user["username"]]
+    if reset_users:
+        with st.form("reset_user_password"):
+            reset_target = st.selectbox("User account", reset_users, format_func=lambda row: f"{row['username']} ({row['role'].replace('_', ' ').title()})")
+            reset_password = st.text_input("New password *", type="password")
+            reset_password_confirmation = st.text_input("Confirm new password *", type="password")
+            reset_submitted = st.form_submit_button("Reset password", type="primary")
+        if reset_submitted:
+            if not reset_password:
+                st.error("A new password is required.")
+            elif reset_password != reset_password_confirmation:
+                st.error("The passwords do not match.")
+            else:
+                with db() as connection:
+                    connection.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash(reset_password), reset_target["id"]))
+                add_audit("Password reset", "Users", f"Reset password for {reset_target['username']}", current_user["username"])
+                st.success(f"Password reset for {reset_target['username']}.")
+    else:
+        st.info("No other user accounts are available in this scope.")
