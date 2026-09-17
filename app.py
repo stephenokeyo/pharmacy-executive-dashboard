@@ -41,6 +41,10 @@ def password_hash(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
+def is_admin(user: dict) -> bool:
+    return str(user.get("role", "")).strip().lower() == "admin"
+
+
 def authenticate(username: str, password: str) -> sqlite3.Row | None:
     rows = query("SELECT * FROM users WHERE username=? AND password_hash=? AND active=1", (username.strip(), password_hash(password)))
     return rows[0] if rows else None
@@ -342,6 +346,7 @@ if "user" not in st.session_state:
     st.stop()
 
 current_user = st.session_state.user
+admin_access = is_admin(current_user)
 st_autorefresh(interval=10000, limit=None, key="realtime_refresh")
 
 st.markdown("""
@@ -363,7 +368,7 @@ h1,h2,h3 { font-family:'Space Grotesk',sans-serif; letter-spacing:0; }
 with st.sidebar:
     st.markdown("<div class='brand'><small>Pharmacy operations</small><h2>MediShelf</h2></div>", unsafe_allow_html=True)
     allowed_pages = ["Dashboard", "Point of Sale", "Daily Sales", "Inventory & Stock", "Suppliers", "Audit Log"]
-    if current_user["role"] == "admin":
+    if admin_access:
         allowed_pages.append("Members")
     page = st.radio("Navigate", allowed_pages, label_visibility="collapsed")
     st.divider()
@@ -461,8 +466,7 @@ elif page == "Point of Sale":
 
 elif page == "Inventory & Stock":
     header("Stock register", "Inventory that stays current.", "Add products, monitor replenishment levels, and export the live register.")
-    is_admin = current_user["role"] == "admin"
-    if is_admin:
+    if admin_access:
         st.markdown("#### Excel stock exchange")
         st.caption("Download the exact template, add or edit rows, then upload it. Existing product codes are updated and new codes are added automatically.")
         excel_left, excel_right = st.columns(2)
@@ -479,7 +483,7 @@ elif page == "Inventory & Stock":
                     st.error(str(error))
         product_form = st.expander("Add new drug product", expanded=False)
     else:
-        st.info("Member access is read-only here. Only Stephen can add, import, update, or delete products.")
+        st.info("Member access is read-only here. An administrator can add, import, update, or delete products.")
         product_form = None
     if product_form:
         with product_form:
@@ -512,10 +516,10 @@ elif page == "Daily Sales":
 
 elif page == "Suppliers":
     header("Supply chain", "Supplier directory.", "Keep contacts, lead times, and payment terms close to the stock they support.")
-    if current_user["role"] == "admin":
+    if admin_access:
         supplier_form = st.form("new_supplier")
     else:
-        st.info("Member access is read-only here. Only Stephen can add or change supplier records.")
+        st.info("Member access is read-only here. An administrator can add or change supplier records.")
         supplier_form = None
     if supplier_form:
         with supplier_form:
