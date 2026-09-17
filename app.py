@@ -88,12 +88,12 @@ def setup_database() -> None:
             );
             CREATE TABLE IF NOT EXISTS suppliers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE, contact_person TEXT DEFAULT '', phone TEXT DEFAULT '',
+                name TEXT NOT NULL, contact_person TEXT DEFAULT '', phone TEXT DEFAULT '',
                 email TEXT DEFAULT '', lead_time_days INTEGER DEFAULT 0, payment_terms TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, product_code TEXT NOT NULL UNIQUE,
+                id INTEGER PRIMARY KEY AUTOINCREMENT, product_code TEXT NOT NULL,
                 name TEXT NOT NULL, category TEXT NOT NULL, supplier_id INTEGER, batch_no TEXT DEFAULT 'N/A',
                 expiry_date TEXT, initial_stock REAL NOT NULL DEFAULT 0, quantity_sold REAL NOT NULL DEFAULT 0,
                 current_stock REAL NOT NULL DEFAULT 0, reorder_level REAL NOT NULL DEFAULT 5,
@@ -134,6 +134,7 @@ def setup_database() -> None:
             if "pharmacy_id" not in columns:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN pharmacy_id INTEGER")
             connection.execute(f"UPDATE {table} SET pharmacy_id=? WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
+        migrate_tenant_constraints(connection)
         connection.execute("UPDATE users SET role='super_admin', pharmacy_id=NULL WHERE username='Stephen'")
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             connection.execute(
@@ -161,6 +162,50 @@ def setup_database() -> None:
             connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at) VALUES(?,?,?,?,?)", ("Initial setup", "Inventory", "Seeded starter pharmacy inventory", "System", now_text()))
         for table in ("suppliers", "products", "sales", "audit_log"):
             connection.execute(f"UPDATE {table} SET pharmacy_id=? WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
+
+
+def migrate_tenant_constraints(connection: sqlite3.Connection) -> None:
+    """Replace legacy global supplier/SKU uniqueness with pharmacy-scoped indexes."""
+    supplier_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='suppliers'").fetchone()[0] or ""
+    product_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='products'").fetchone()[0] or ""
+    if "name TEXT NOT NULL UNIQUE" in supplier_sql or "product_code TEXT NOT NULL UNIQUE" in product_sql:
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("ALTER TABLE sale_items RENAME TO sale_items_legacy")
+        connection.execute("ALTER TABLE products RENAME TO products_legacy")
+        connection.execute("ALTER TABLE suppliers RENAME TO suppliers_legacy")
+        connection.executescript(
+            """
+            CREATE TABLE suppliers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact_person TEXT DEFAULT '', phone TEXT DEFAULT '',
+                email TEXT DEFAULT '', lead_time_days INTEGER DEFAULT 0, payment_terms TEXT DEFAULT '',
+                created_at TEXT NOT NULL, pharmacy_id INTEGER, UNIQUE(name, pharmacy_id)
+            );
+            CREATE TABLE products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, product_code TEXT NOT NULL,
+                name TEXT NOT NULL, category TEXT NOT NULL, supplier_id INTEGER, batch_no TEXT DEFAULT 'N/A',
+                expiry_date TEXT, initial_stock REAL NOT NULL DEFAULT 0, quantity_sold REAL NOT NULL DEFAULT 0,
+                current_stock REAL NOT NULL DEFAULT 0, reorder_level REAL NOT NULL DEFAULT 5,
+                unit_cost REAL NOT NULL DEFAULT 0, selling_price REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, pharmacy_id INTEGER,
+                UNIQUE(product_code, pharmacy_id), FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL
+            );
+            CREATE TABLE sale_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+                quantity REAL NOT NULL, unit_price REAL NOT NULL, line_total REAL NOT NULL,
+                FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE, FOREIGN KEY (product_id) REFERENCES products(id)
+            );
+            INSERT INTO suppliers SELECT id,name,contact_person,phone,email,lead_time_days,payment_terms,created_at,pharmacy_id FROM suppliers_legacy;
+            INSERT INTO products SELECT id,product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at,pharmacy_id FROM products_legacy;
+            INSERT INTO sale_items SELECT id,sale_id,product_id,quantity,unit_price,line_total FROM sale_items_legacy;
+            DROP TABLE sale_items_legacy;
+            DROP TABLE products_legacy;
+            DROP TABLE suppliers_legacy;
+            """
+        )
+        connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS suppliers_name_pharmacy_idx ON suppliers(name, pharmacy_id)")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS products_code_pharmacy_idx ON products(product_code, pharmacy_id)")
 
 
 def query(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
