@@ -68,8 +68,24 @@ def pharmacy_scope(alias: str = "") -> tuple[str, tuple]:
     return f" WHERE {column}=?", (active_pharmacy_id(),)
 
 
-def authenticate(username: str, password: str) -> sqlite3.Row | None:
-    rows = query("SELECT u.*, p.name AS pharmacy_name FROM users u LEFT JOIN pharmacies p ON p.id=u.pharmacy_id WHERE u.username=? AND u.password_hash=? AND u.active=1", (username.strip(), password_hash(password)))
+def authenticate(username: str, password: str, pharmacy_id: int | None = None) -> sqlite3.Row | None:
+    params: tuple = (username.strip(), password_hash(password))
+    pharmacy_filter = ""
+    if pharmacy_id is not None:
+        pharmacy_filter = " AND (u.pharmacy_id=? OR u.role='super_admin')"
+        params += (pharmacy_id,)
+    rows = query(f"SELECT u.*, p.name AS pharmacy_name FROM users u LEFT JOIN pharmacies p ON p.id=u.pharmacy_id WHERE u.username=? AND u.password_hash=? AND u.active=1{pharmacy_filter}", params)
+    return rows[0] if rows else None
+
+
+def login_pharmacy() -> sqlite3.Row | None:
+    pharmacy_value = st.query_params.get("pharmacy")
+    if not pharmacy_value:
+        return None
+    try:
+        rows = query("SELECT id,name,location FROM pharmacies WHERE id=? AND active=1", (int(pharmacy_value),))
+    except ValueError:
+        return None
     return rows[0] if rows else None
 
 
@@ -419,13 +435,16 @@ def receipt_html(receipt: str) -> str:
 setup_database()
 
 if "user" not in st.session_state:
-    st.markdown("<div class='hero'><div class='section-kicker' style='color:#9ce3ca'>Secure pharmacy operations</div><h1>Welcome to Eashers Pharmacy.</h1><p>Sign in to manage stock, sales, suppliers, and reports.</p></div>", unsafe_allow_html=True)
+    requested_pharmacy = login_pharmacy()
+    login_name = requested_pharmacy["name"] if requested_pharmacy else "Eashers Pharmacy"
+    st.markdown(f"<div class='hero'><div class='section-kicker' style='color:#9ce3ca'>Secure pharmacy operations</div><h1>Welcome to {html.escape(login_name)}.</h1><p>Sign in to manage stock, sales, suppliers, and reports.</p></div>", unsafe_allow_html=True)
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
     if submitted:
-        authenticated = authenticate(username, password)
+        requested_id = requested_pharmacy["id"] if requested_pharmacy else None
+        authenticated = authenticate(username, password, requested_id)
         if authenticated:
             st.session_state.user = dict(authenticated)
             st.session_state.selected_pharmacy_id = authenticated["pharmacy_id"]
@@ -666,11 +685,15 @@ elif page == "Pharmacies":
                     pharmacy_id = connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?)", (pharmacy_name.strip(), pharmacy_location.strip(), now_text())).lastrowid
                     connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (admin_name.strip(), password_hash(admin_password), "admin", 1, 1, 1, 1, now_text(), pharmacy_id))
                 st.success(f"Created {pharmacy_name.strip()} with admin {admin_name.strip()}.")
-                st.rerun()
+                st.markdown(f"**Pharmacy login link:** [Open {html.escape(pharmacy_name.strip())} login](?pharmacy={pharmacy_id})")
+                st.caption("Share this link with the pharmacy administrator. They will see this pharmacy name on the login screen.")
             except sqlite3.IntegrityError:
                 st.error("The pharmacy name or admin username already exists.")
-    pharmacies = pd.read_sql_query("SELECT name,location,active,created_at FROM pharmacies ORDER BY name", db())
-    st.dataframe(pharmacies.rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
+    pharmacies = pd.read_sql_query("SELECT id,name,location,active,created_at FROM pharmacies ORDER BY name", db())
+    st.dataframe(pharmacies.drop(columns=["id"]).rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Pharmacy login links")
+    for pharmacy in pharmacies.itertuples():
+        st.markdown(f"- [{html.escape(pharmacy.name)} login](?pharmacy={pharmacy.id})")
 
 elif page == "Members":
     header("Access control", "Team members.", "Create accounts and manage passwords within the current pharmacy scope.")
