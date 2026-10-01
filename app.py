@@ -210,6 +210,7 @@ def money(value: float | int | None) -> str:
     return f"{CURRENCY} {float(value or 0):,.2f}"
 
 
+@st.cache_resource(show_spinner=False)
 def setup_database() -> None:
     if DB_BACKEND != "postgres":
         raise RuntimeError("SecureTech requires Supabase. Set SUPABASE_DATABASE_URL before running the app.")
@@ -434,10 +435,15 @@ def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admi
     })
 
 
+@st.cache_data(ttl=5, max_entries=64)
+def load_products_for_scope(where: str, params: tuple) -> pd.DataFrame:
+    sql = f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name"
+    return pd.DataFrame.from_records(dict(row) for row in query(sql, params))
+
+
 def load_products() -> pd.DataFrame:
     where, params = pharmacy_scope("p")
-    sql = f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name"
-    return pd.read_sql_query(sql_for_backend(sql), db(), params=params)
+    return load_products_for_scope(where, params)
 
 
 def inventory_excel_bytes() -> bytes:
@@ -664,8 +670,6 @@ if is_super_admin(current_user) and st.session_state.get("selected_pharmacy_id")
     first_pharmacy = query("SELECT id FROM pharmacies WHERE active=1 ORDER BY name LIMIT 1")
     if first_pharmacy:
         st.session_state.selected_pharmacy_id = first_pharmacy[0]["id"]
-st_autorefresh(interval=10000, limit=None, key="realtime_refresh")
-
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
@@ -690,6 +694,8 @@ with st.sidebar:
     if is_super_admin(current_user):
         allowed_pages.append("Pharmacies")
     page = st.radio("Navigate", allowed_pages, label_visibility="collapsed")
+    if page == "Dashboard":
+        st_autorefresh(interval=60000, limit=None, key="dashboard_refresh")
     st.divider()
     if is_super_admin(current_user):
         pharmacy_options = query("SELECT id,name FROM pharmacies WHERE active=1 ORDER BY name")
@@ -708,9 +714,8 @@ def header(kicker: str, title: str, subtitle: str) -> None:
     st.markdown(f"<div class='hero'><div class='section-kicker' style='color:#9ce3ca'>{kicker}</div><h1>{title}</h1><p>{subtitle}</p></div>", unsafe_allow_html=True)
 
 
-products = load_products()
-
 if page == "Dashboard":
+    products = load_products()
     header("Executive view", "A clearer shelf, every day.", "Track stock health, revenue, expiry exposure, and the work that needs attention.")
     sales_where, sales_params = pharmacy_scope("sales")
     sales = query(f"SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales{sales_where} AND date(created_at)=date('now')" if sales_where else "SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales WHERE date(created_at)=date('now')", sales_params)[0]
@@ -739,6 +744,7 @@ if page == "Dashboard":
         st.bar_chart(counts, height=260)
 
 elif page == "Point of Sale":
+    products = load_products()
     header("Sales counter", "Point of sale.", "Build a sale, keep stock accurate, and issue a clean printable receipt.")
     if "cart" not in st.session_state: st.session_state.cart = []
     available_products = products[products.current_stock > 0]
@@ -791,6 +797,7 @@ elif page == "Point of Sale":
         st.download_button("Download receipt Excel", receipt_excel_bytes(receipt), f"{receipt}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif page == "Inventory & Stock":
+    products = load_products()
     header("Stock register", "Inventory that stays current.", "Add products, monitor replenishment levels, and export the live register.")
     if admin_access:
         st.markdown("#### Excel stock exchange")
