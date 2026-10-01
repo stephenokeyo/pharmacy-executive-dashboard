@@ -843,6 +843,7 @@ def receipt_html(receipt: str) -> str:
 
 firebase_firestore_client()
 setup_database()
+schedule_firebase_sync()
 
 if "user" not in st.session_state:
     requested_pharmacy = login_pharmacy()
