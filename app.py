@@ -466,9 +466,12 @@ def inventory_excel_bytes() -> bytes:
 
 
 def dataframe_excel_bytes(frame: pd.DataFrame, sheet_name: str = "Report") -> bytes:
+    export = frame.copy()
+    for column in export.select_dtypes(include=["datetimetz"]).columns:
+        export[column] = export[column].dt.tz_localize(None)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        frame.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        export.to_excel(writer, index=False, sheet_name=sheet_name[:31])
     return output.getvalue()
 
 
