@@ -67,10 +67,14 @@ class DatabaseConnection:
         return False
 
     def execute(self, sql: str, params: tuple = ()):
-        return self.raw.execute(sql_for_backend(sql), params)
+        cursor = self.raw.cursor()
+        cursor.execute(sql_for_backend(sql), params)
+        return cursor
 
     def executemany(self, sql: str, params):
-        return self.raw.executemany(sql_for_backend(sql), params)
+        cursor = self.raw.cursor()
+        cursor.executemany(sql_for_backend(sql), params)
+        return cursor
 
     def commit(self):
         self.raw.commit()
@@ -93,7 +97,7 @@ def db():
         raise RuntimeError("SecureTech requires Supabase. Set SUPABASE_DATABASE_URL in the environment before starting the app.")
     if psycopg2 is None:
         raise RuntimeError("psycopg2 is required for the real PostgreSQL backend.")
-    return DatabaseConnection(psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor))
+    return DatabaseConnection(psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor))
 
 
 def sql_for_backend(sql: str) -> str:
@@ -575,8 +579,8 @@ def import_inventory_excel(content: bytes, performed_by: str) -> tuple[int, int]
             supplier_name = "Unassigned" if pd.isna(row["Supplier Name"]) else str(row["Supplier Name"]).strip() or "Unassigned"
             supplier = connection.execute("SELECT id FROM suppliers WHERE name=? AND pharmacy_id=?", (supplier_name, write_pharmacy_id())).fetchone()
             if not supplier:
-                supplier = connection.execute("INSERT INTO suppliers(name,created_at,pharmacy_id) VALUES(?,?,?)", (supplier_name, now_text(), write_pharmacy_id()))
-                supplier_id = supplier.lastrowid
+                supplier = connection.execute("INSERT INTO suppliers(name,created_at,pharmacy_id) VALUES(?,?,?) RETURNING id", (supplier_name, now_text(), write_pharmacy_id())).fetchone()
+                supplier_id = supplier["id"]
             else:
                 supplier_id = supplier["id"]
             values = (row["Product Name"], "Medicine", supplier_id, row["Batch No"] or "N/A", row["Expiry Date"], row["Initial Stock"], row["QTY Sold"], row["Current Stock"], row["Reorder Level"], row["Unit Cost (KSh)"], row["Selling Price (KSh)"], now_text(), row["Product ID"])
@@ -614,7 +618,8 @@ def create_sale(cart: list[dict], customer: str, payment: str, discount: float, 
     current_time = datetime.now(EAT)
     receipt = f"POS-{current_time:%Y%m%d}-{current_time.microsecond // 1000:03d}"
     with db() as connection:
-        sale_id = connection.execute("INSERT INTO sales(receipt_no,customer_name,payment_method,subtotal,discount,total,cashier,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (receipt, customer, payment, subtotal, discount, total, cashier, now_text(), write_pharmacy_id())).lastrowid
+        sale = connection.execute("INSERT INTO sales(receipt_no,customer_name,payment_method,subtotal,discount,total,cashier,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id", (receipt, customer, payment, subtotal, discount, total, cashier, now_text(), write_pharmacy_id())).fetchone()
+        sale_id = sale["id"]
         for item in cart:
             connection.execute("INSERT INTO sale_items(sale_id,product_id,quantity,unit_price,line_total) VALUES(?,?,?,?,?)", (sale_id, item["id"], item["quantity"], item["unit_price"], item["quantity"] * item["unit_price"]))
             connection.execute("UPDATE products SET current_stock=current_stock-?, quantity_sold=quantity_sold+?, updated_at=? WHERE id=?", (item["quantity"], item["quantity"], now_text(), item["id"]))
@@ -882,7 +887,8 @@ elif page == "Pharmacies":
         else:
             try:
                 with db() as connection:
-                    pharmacy_id = connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?)", (pharmacy_name.strip(), pharmacy_location.strip(), now_text())).lastrowid
+                    pharmacy = connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?) RETURNING id", (pharmacy_name.strip(), pharmacy_location.strip(), now_text())).fetchone()
+                    pharmacy_id = pharmacy["id"]
                     connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (admin_name.strip(), password_hash(admin_password), "admin", 1, 1, 1, 1, now_text(), pharmacy_id))
                 st.success(f"Created {pharmacy_name.strip()} with admin {admin_name.strip()}.")
                 st.markdown(f"**Pharmacy login link:** [Open {html.escape(pharmacy_name.strip())} login](?pharmacy={pharmacy_id})")
