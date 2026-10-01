@@ -1,6 +1,6 @@
 # SECURE TECH SOLUTIONS
 
-A pharmacy operations application built with Streamlit, using Supabase/PostgreSQL for relational records and Firebase Firestore for required audit-event storage.
+A pharmacy operations application built with Streamlit, using Supabase/PostgreSQL as the source of truth and Firebase Firestore as a mirror of operational records.
 
 ## Start
 
@@ -19,7 +19,7 @@ Both Firebase and Supabase are required for the application to start.
 
 Create a Firebase service account with Firestore access and enable Cloud Firestore in the project. Download its JSON key, then add it in Render under the service's **Environment > Secret Files** as `firebase-service-account.json`. The app reads it from Render's `/etc/secrets/` directory. Keep this file private and never commit it.
 
-For local development, set `FIREBASE_SERVICE_ACCOUNT_FILE` to the JSON file path. Alternatively, provide the complete JSON through `FIREBASE_SERVICE_ACCOUNT_JSON`. The app verifies Firestore connectivity at startup and writes audit events to the `audit_log` collection.
+For local development, set `FIREBASE_SERVICE_ACCOUNT_FILE` to the JSON file path. Alternatively, provide the complete JSON through `FIREBASE_SERVICE_ACCOUNT_JSON`. The app mirrors pharmacy, supplier, product, sale, sale-item, and audit records into Firestore collections named `securetech_<table>` using a PostgreSQL transactional outbox. Existing rows are queued once during setup; later inserts, updates, and deletes are queued in the same Supabase transaction and delivered to Firestore after commit. Supabase remains authoritative, and Firestore catches up automatically if temporarily unavailable. User password hashes are intentionally not copied to Firestore.
 
 ### Supabase / Postgres
 Set these in Render or your hosting environment:

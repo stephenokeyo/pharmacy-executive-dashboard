@@ -4,6 +4,7 @@ import html
 import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -47,6 +48,8 @@ INVENTORY_EXCEL_COLUMNS = [
     "QTY Sold", "Current Stock", "Reorder Level", "Unit Cost (KSh)", "Total Cost (KSh)", "Markup %",
     "Selling Price (KSh)", "Expiry Status", "Stock Status",
 ]
+FIRESTORE_MIRROR_TABLES = ("pharmacies", "suppliers", "products", "sales", "sale_items", "audit_log", "users")
+LOGGER = logging.getLogger(__name__)
 
 st.set_page_config(page_title="SecureTech Slns", page_icon="+", layout="wide", initial_sidebar_state="expanded")
 
@@ -54,33 +57,51 @@ st.set_page_config(page_title="SecureTech Slns", page_icon="+", layout="wide", i
 class DatabaseConnection:
     def __init__(self, raw_connection):
         self.raw = raw_connection
+        self.has_writes = False
+
+    def _track_write(self, sql: str) -> None:
+        parts = sql.lstrip().split(None, 1)
+        if parts and parts[0].upper() in {"INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE"}:
+            self.has_writes = True
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        should_sync = False
         if exc_type is None:
             self.raw.commit()
+            should_sync = self.has_writes
         else:
             self.raw.rollback()
         self.raw.close()
+        self.has_writes = False
+        if should_sync:
+            sync_firebase_outbox()
         return False
 
     def execute(self, sql: str, params: tuple = ()):
+        self._track_write(sql)
         cursor = self.raw.cursor()
         cursor.execute(sql_for_backend(sql), params)
         return cursor
 
     def executemany(self, sql: str, params):
+        self._track_write(sql)
         cursor = self.raw.cursor()
         cursor.executemany(sql_for_backend(sql), params)
         return cursor
 
     def commit(self):
         self.raw.commit()
+        should_sync = self.has_writes
+        self.has_writes = False
+        if should_sync:
+            sync_firebase_outbox()
 
     def rollback(self):
         self.raw.rollback()
+        self.has_writes = False
 
     def close(self):
         self.raw.close()
@@ -148,6 +169,139 @@ def firebase_firestore_client():
     client = firestore.client(app=firebase_app())
     client.collection("securetech_system").limit(1).get()
     return client
+
+
+def setup_firestore_mirror(connection: DatabaseConnection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS securetech_firestore_outbox (
+            id BIGSERIAL PRIMARY KEY,
+            table_name TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            payload JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            processed_at TIMESTAMPTZ
+        );
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS securetech_firestore_outbox_pending_idx
+        ON securetech_firestore_outbox(id) WHERE processed_at IS NULL;
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS securetech_firestore_sync_state (
+            name TEXT PRIMARY KEY,
+            initialized_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    connection.execute(
+        """
+        CREATE OR REPLACE FUNCTION securetech_queue_firestore_change() RETURNS TRIGGER AS $securetech$
+        DECLARE row_data JSONB;
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                row_data := to_jsonb(OLD);
+            ELSE
+                row_data := to_jsonb(NEW);
+            END IF;
+            INSERT INTO securetech_firestore_outbox(table_name, record_id, operation, payload)
+            VALUES (TG_TABLE_NAME, row_data ->> 'id', TG_OP, row_data);
+            IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+            END IF;
+            RETURN NEW;
+        END;
+        $securetech$ LANGUAGE plpgsql;
+        """
+    )
+    for table_name in FIRESTORE_MIRROR_TABLES:
+        connection.execute(f"DROP TRIGGER IF EXISTS securetech_firestore_mirror_trigger ON {table_name}")
+        connection.execute(
+            f"""
+            CREATE TRIGGER securetech_firestore_mirror_trigger
+            AFTER INSERT OR UPDATE OR DELETE ON {table_name}
+            FOR EACH ROW EXECUTE FUNCTION securetech_queue_firestore_change()
+            """
+        )
+
+    snapshot = connection.execute(
+        "INSERT INTO securetech_firestore_sync_state(name) VALUES(%s) ON CONFLICT DO NOTHING RETURNING name",
+        ("initial_snapshot",),
+    ).fetchone()
+    if snapshot:
+        for table_name in FIRESTORE_MIRROR_TABLES:
+            connection.execute(
+                f"""
+                INSERT INTO securetech_firestore_outbox(table_name,record_id,operation,payload)
+                SELECT %s, id::TEXT, 'UPSERT', to_jsonb(source) FROM {table_name} AS source
+                """,
+                (table_name,),
+            )
+
+
+def sync_firebase_outbox(batch_size: int = 400) -> int:
+    if DB_BACKEND != "postgres" or psycopg2 is None:
+        return 0
+    raw_connection = None
+    synced = 0
+    try:
+        client = firebase_firestore_client()
+        raw_connection = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
+        while True:
+            with raw_connection:
+                with raw_connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT id,table_name,record_id,operation,payload
+                        FROM securetech_firestore_outbox
+                        WHERE processed_at IS NULL
+                        ORDER BY id
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                        """,
+                        (batch_size,),
+                    )
+                    rows = cursor.fetchall()
+                    if not rows:
+                        break
+
+                    latest_changes = {}
+                    outbox_ids = []
+                    for row in rows:
+                        outbox_ids.append(row["id"])
+                        latest_changes[(row["table_name"], str(row["record_id"]))] = row
+
+                    batch = client.batch()
+                    for (table_name, record_id), row in latest_changes.items():
+                        document = client.collection(f"securetech_{table_name}").document(record_id)
+                        if row["operation"] == "DELETE":
+                            batch.delete(document)
+                            continue
+                        payload = dict(row["payload"] or {})
+                        if table_name == "users":
+                            payload.pop("password_hash", None)
+                        batch.set(document, payload)
+
+                    batch.commit()
+                    cursor.execute(
+                        "UPDATE securetech_firestore_outbox SET processed_at=NOW() WHERE id=ANY(%s)",
+                        (outbox_ids,),
+                    )
+                    synced += len(rows)
+        return synced
+    except Exception:
+        if raw_connection is not None:
+            raw_connection.rollback()
+        LOGGER.exception("Firestore mirror sync failed; changes remain queued in Supabase.")
+        return synced
+    finally:
+        if raw_connection is not None:
+            raw_connection.close()
 
 
 def now_text() -> str:
@@ -340,6 +494,7 @@ def setup_database_postgres() -> None:
             if not check:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN pharmacy_id INTEGER")
             connection.execute(f"UPDATE {table} SET pharmacy_id=%s WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
+        setup_firestore_mirror(connection)
         connection.execute("UPDATE users SET role='super_admin', pharmacy_id=NULL WHERE username='Stephen'")
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             connection.execute(
@@ -421,18 +576,8 @@ def query(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 
 
 def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admin") -> None:
-    created_at = now_text()
-    pharmacy_id = write_pharmacy_id()
     with db() as connection:
-        connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, created_at, pharmacy_id))
-    firebase_firestore_client().collection("audit_log").add({
-        "action_type": action,
-        "entity": entity,
-        "details": details,
-        "performed_by": user,
-        "created_at": created_at,
-        "pharmacy_id": pharmacy_id,
-    })
+        connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, now_text(), write_pharmacy_id()))
 
 
 @st.cache_data(ttl=5, max_entries=64)
