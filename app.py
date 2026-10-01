@@ -3,10 +3,26 @@ from __future__ import annotations
 import html
 import hashlib
 import io
+import json
+import os
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:  # pragma: no cover
+    psycopg2 = None
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+except ImportError:  # pragma: no cover
+    firebase_admin = None
+    credentials = None
+    firestore = None
 
 import pandas as pd
 import streamlit as st
@@ -15,6 +31,15 @@ from streamlit_autorefresh import st_autorefresh
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "pharmacy.db"
+SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("SUPABASE_PUBLIC_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+DATABASE_URL = os.getenv("SUPABASE_DATABASE_URL")
+DB_BACKEND = "postgres" if DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://", "postgresql+psycopg2://")) else "required_postgres"
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
+FIREBASE_PRIVATE_KEY = (os.getenv("FIREBASE_PRIVATE_KEY") or "").replace("\\n", "\n")
+FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+FIREBASE_SERVICE_ACCOUNT_FILE = Path(os.getenv("FIREBASE_SERVICE_ACCOUNT_FILE", "/etc/secrets/firebase-service-account.json"))
 CURRENCY = "KSh"
 EAT = ZoneInfo("Africa/Nairobi")
 INVENTORY_EXCEL_COLUMNS = [
@@ -23,14 +48,102 @@ INVENTORY_EXCEL_COLUMNS = [
     "Selling Price (KSh)", "Expiry Status", "Stock Status",
 ]
 
-st.set_page_config(page_title="Eashers Pharmacy", page_icon="+", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="SecureTech Slns", page_icon="+", layout="wide", initial_sidebar_state="expanded")
 
 
-def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+class DatabaseConnection:
+    def __init__(self, raw_connection):
+        self.raw = raw_connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.raw.commit()
+        else:
+            self.raw.rollback()
+        self.raw.close()
+        return False
+
+    def execute(self, sql: str, params: tuple = ()):
+        return self.raw.execute(sql_for_backend(sql), params)
+
+    def executemany(self, sql: str, params):
+        return self.raw.executemany(sql_for_backend(sql), params)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        self.raw.close()
+
+    def cursor(self):
+        return self.raw.cursor()
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+
+def db():
+    if DB_BACKEND != "postgres":
+        raise RuntimeError("SecureTech requires Supabase. Set SUPABASE_DATABASE_URL in the environment before starting the app.")
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 is required for the real PostgreSQL backend.")
+    return DatabaseConnection(psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor))
+
+
+def sql_for_backend(sql: str) -> str:
+    if DB_BACKEND == "postgres":
+        return sql.replace("?", "%s")
+    return sql
+
+
+def firebase_credential() -> object | None:
+    if firebase_admin is None or credentials is None:
+        raise RuntimeError("firebase-admin is required. Install the project requirements before starting SecureTech.")
+    if FIREBASE_SERVICE_ACCOUNT_JSON:
+        try:
+            return credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON must contain valid service-account JSON.") from error
+    if FIREBASE_SERVICE_ACCOUNT_FILE.is_file():
+        return credentials.Certificate(str(FIREBASE_SERVICE_ACCOUNT_FILE))
+    if FIREBASE_PROJECT_ID and FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY:
+        return credentials.Certificate({
+            "type": "service_account",
+            "project_id": FIREBASE_PROJECT_ID,
+            "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID", ""),
+            "private_key": FIREBASE_PRIVATE_KEY,
+            "client_email": FIREBASE_CLIENT_EMAIL,
+            "client_id": os.getenv("FIREBASE_CLIENT_ID", ""),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_X509_CERT_URL", f"https://www.googleapis.com/robot/v1/metadata/x509/{FIREBASE_CLIENT_EMAIL}"),
+        })
+    raise RuntimeError("Firebase is required. Add the service-account JSON secret file or set FIREBASE_SERVICE_ACCOUNT_JSON.")
+
+
+def firebase_app():
+    if not firebase_admin._apps:
+        cred = firebase_credential()
+        project_id = FIREBASE_PROJECT_ID or os.getenv("GOOGLE_CLOUD_PROJECT")
+        options = {"projectId": project_id} if project_id else None
+        firebase_admin.initialize_app(cred, options)
+    return firebase_admin.get_app()
+
+
+@st.cache_resource(show_spinner=False)
+def firebase_firestore_client():
+    if firestore is None:
+        raise RuntimeError("firebase-admin is required to connect to Firestore.")
+    client = firestore.client(app=firebase_app())
+    client.collection("securetech_system").limit(1).get()
+    return client
 
 
 def now_text() -> str:
@@ -94,67 +207,138 @@ def money(value: float | int | None) -> str:
 
 
 def setup_database() -> None:
+    if DB_BACKEND != "postgres":
+        raise RuntimeError("SecureTech requires Supabase. Set SUPABASE_DATABASE_URL before running the app.")
+    setup_database_postgres()
+
+
+def setup_database_postgres() -> None:
     with db() as connection:
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS pharmacies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE, location TEXT DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                location TEXT DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS suppliers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL, contact_person TEXT DEFAULT '', phone TEXT DEFAULT '',
-                email TEXT DEFAULT '', lead_time_days INTEGER DEFAULT 0, payment_terms TEXT DEFAULT '',
-                created_at TEXT NOT NULL
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                contact_person TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                email TEXT DEFAULT '',
+                lead_time_days INTEGER DEFAULT 0,
+                payment_terms TEXT DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                pharmacy_id INTEGER,
+                UNIQUE(name, pharmacy_id)
             );
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, product_code TEXT NOT NULL,
-                name TEXT NOT NULL, category TEXT NOT NULL, supplier_id INTEGER, batch_no TEXT DEFAULT 'N/A',
-                expiry_date TEXT, initial_stock REAL NOT NULL DEFAULT 0, quantity_sold REAL NOT NULL DEFAULT 0,
-                current_stock REAL NOT NULL DEFAULT 0, reorder_level REAL NOT NULL DEFAULT 5,
-                unit_cost REAL NOT NULL DEFAULT 0, selling_price REAL NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                id SERIAL PRIMARY KEY,
+                product_code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                supplier_id INTEGER,
+                batch_no TEXT DEFAULT 'N/A',
+                expiry_date TEXT,
+                initial_stock REAL NOT NULL DEFAULT 0,
+                quantity_sold REAL NOT NULL DEFAULT 0,
+                current_stock REAL NOT NULL DEFAULT 0,
+                reorder_level REAL NOT NULL DEFAULT 5,
+                unit_cost REAL NOT NULL DEFAULT 0,
+                selling_price REAL NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                pharmacy_id INTEGER,
+                UNIQUE(product_code, pharmacy_id),
                 FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL
             );
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS sales (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, receipt_no TEXT NOT NULL UNIQUE,
-                customer_name TEXT NOT NULL, payment_method TEXT NOT NULL, subtotal REAL NOT NULL,
-                discount REAL NOT NULL DEFAULT 0, total REAL NOT NULL, cashier TEXT NOT NULL, created_at TEXT NOT NULL
+                id SERIAL PRIMARY KEY,
+                receipt_no TEXT NOT NULL UNIQUE,
+                customer_name TEXT NOT NULL,
+                payment_method TEXT NOT NULL,
+                subtotal REAL NOT NULL,
+                discount REAL NOT NULL DEFAULT 0,
+                total REAL NOT NULL,
+                cashier TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                pharmacy_id INTEGER
             );
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS sale_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
-                quantity REAL NOT NULL, unit_price REAL NOT NULL, line_total REAL NOT NULL,
+                id SERIAL PRIMARY KEY,
+                sale_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                line_total REAL NOT NULL,
                 FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
                 FOREIGN KEY (product_id) REFERENCES products(id)
             );
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, action_type TEXT NOT NULL, entity TEXT NOT NULL,
-                details TEXT NOT NULL, performed_by TEXT NOT NULL, created_at TEXT NOT NULL
+                id SERIAL PRIMARY KEY,
+                action_type TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                details TEXT NOT NULL,
+                performed_by TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                pharmacy_id INTEGER
             );
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'member', can_manage_inventory INTEGER NOT NULL DEFAULT 0,
-                can_manage_suppliers INTEGER NOT NULL DEFAULT 0, can_view_reports INTEGER NOT NULL DEFAULT 0,
-                can_view_audit INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                can_manage_inventory INTEGER NOT NULL DEFAULT 0,
+                can_manage_suppliers INTEGER NOT NULL DEFAULT 0,
+                can_view_reports INTEGER NOT NULL DEFAULT 0,
+                can_view_audit INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                pharmacy_id INTEGER
             );
             """
         )
         default_pharmacy = connection.execute("SELECT id FROM pharmacies ORDER BY id LIMIT 1").fetchone()
         if default_pharmacy is None:
-            connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?)", ("Eashers Pharmacy", "Ruiru Town, Kiambu", now_text()))
+            connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(%s,%s,%s)", ("SecureTech Slns", "Ruiru Town, Kiambu", now_text()))
             default_pharmacy = connection.execute("SELECT id FROM pharmacies ORDER BY id LIMIT 1").fetchone()
-        default_pharmacy_id = default_pharmacy[0]
+        default_pharmacy_id = default_pharmacy["id"]
         for table in ("suppliers", "products", "sales", "audit_log", "users"):
-            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
-            if "pharmacy_id" not in columns:
+            check = connection.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table}' AND column_name = 'pharmacy_id'").fetchall()
+            if not check:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN pharmacy_id INTEGER")
-            connection.execute(f"UPDATE {table} SET pharmacy_id=? WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
-        migrate_tenant_constraints(connection)
+            connection.execute(f"UPDATE {table} SET pharmacy_id=%s WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
         connection.execute("UPDATE users SET role='super_admin', pharmacy_id=NULL WHERE username='Stephen'")
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             connection.execute(
-                "INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 ("Stephen", password_hash("Stephen@12k"), "super_admin", 1, 1, 1, 1, now_text(), None),
             )
         if connection.execute("SELECT COUNT(*) FROM suppliers").fetchone()[0] == 0:
@@ -163,9 +347,9 @@ def setup_database() -> None:
                 ("Jellings Healthcare", "Sarah Otieno", "+254 722 987 654", "sales@jellings.co.ke", 2, "Cash on Delivery"),
                 ("Philmed Distributors", "David Kamau", "+254 733 456 789", "info@philmed.co.ke", 5, "14 Days Credit"),
             ]
-            connection.executemany("INSERT INTO suppliers(name,contact_person,phone,email,lead_time_days,payment_terms,created_at) VALUES(?,?,?,?,?,?,?)", [row + (now_text(),) for row in suppliers])
+            connection.executemany("INSERT INTO suppliers(name,contact_person,phone,email,lead_time_days,payment_terms,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s)", [row + (now_text(),) for row in suppliers])
         if connection.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-            supplier = connection.execute("SELECT id FROM suppliers ORDER BY id LIMIT 1").fetchone()[0]
+            supplier = connection.execute("SELECT id FROM suppliers ORDER BY id LIMIT 1").fetchone()["id"]
             products = [
                 ("PRD-1001", "Albendazole Susp 400mg", "Antiparasitic", supplier, "B-2401", "2027-05-01", 10, 2, 8, 5, 16, 50),
                 ("PRD-1002", "Amoxicillin 100ml Susp", "Antibiotic", supplier, "B-2402", "2027-08-01", 12, 4, 8, 5, 75, 150),
@@ -174,14 +358,16 @@ def setup_database() -> None:
                 ("PRD-1005", "Cefuroxime 500mg", "Antibiotic", supplier, "B-2405", "2026-12-20", 6, 6, 0, 3, 250, 500),
                 ("PRD-1006", "ORS Sachets", "Rehydration", supplier, "B-2406", "2028-03-01", 80, 20, 60, 15, 8, 20),
             ]
-            connection.executemany("INSERT INTO products(product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [row + (now_text(), now_text()) for row in products])
-            connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at) VALUES(?,?,?,?,?)", ("Initial setup", "Inventory", "Seeded starter pharmacy inventory", "System", now_text()))
+            connection.executemany("INSERT INTO products(product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", [row + (now_text(), now_text()) for row in products])
+            connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at) VALUES(%s,%s,%s,%s,%s)", ("Initial setup", "Inventory", "Seeded starter pharmacy inventory", "System", now_text()))
         for table in ("suppliers", "products", "sales", "audit_log"):
-            connection.execute(f"UPDATE {table} SET pharmacy_id=? WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
+            connection.execute(f"UPDATE {table} SET pharmacy_id=%s WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
 
 
 def migrate_tenant_constraints(connection: sqlite3.Connection) -> None:
     """Replace legacy global supplier/SKU uniqueness with pharmacy-scoped indexes."""
+    if DB_BACKEND == "postgres":
+        return
     supplier_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='suppliers'").fetchone()[0] or ""
     product_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='products'").fetchone()[0] or ""
     if "name TEXT NOT NULL UNIQUE" in supplier_sql or "product_code TEXT NOT NULL UNIQUE" in product_sql:
@@ -226,17 +412,28 @@ def migrate_tenant_constraints(connection: sqlite3.Connection) -> None:
 
 def query(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
     with db() as connection:
-        return connection.execute(sql, params).fetchall()
+        return connection.execute(sql_for_backend(sql), params).fetchall()
 
 
 def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admin") -> None:
+    created_at = now_text()
+    pharmacy_id = write_pharmacy_id()
     with db() as connection:
-        connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, now_text(), write_pharmacy_id()))
+        connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, created_at, pharmacy_id))
+    firebase_firestore_client().collection("audit_log").add({
+        "action_type": action,
+        "entity": entity,
+        "details": details,
+        "performed_by": user,
+        "created_at": created_at,
+        "pharmacy_id": pharmacy_id,
+    })
 
 
 def load_products() -> pd.DataFrame:
     where, params = pharmacy_scope("p")
-    return pd.read_sql_query(f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name", db(), params=params)
+    sql = f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name"
+    return pd.read_sql_query(sql_for_backend(sql), db(), params=params)
 
 
 def inventory_excel_bytes() -> bytes:
@@ -429,14 +626,15 @@ def receipt_html(receipt: str) -> str:
     sale = query("SELECT * FROM sales WHERE receipt_no=?", (receipt,))[0]
     items = query("SELECT si.*, p.name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=?", (sale["id"],))
     rows = "".join(f"<tr><td>{html.escape(item['name'])}</td><td>{item['quantity']:g}</td><td>{money(item['line_total'])}</td></tr>" for item in items)
-    return f"""<div class='receipt'><h2>MEDISHELF PHARMACY</h2><p>Ruiru Town, Kiambu · +254 700 000 000</p><hr><p><b>Receipt:</b> {receipt}<br><b>Date:</b> {sale['created_at']}<br><b>Customer:</b> {html.escape(sale['customer_name'])}<br><b>Payment:</b> {sale['payment_method']}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing MediShelf Pharmacy.</p></div>"""
+    return f"""<div class='receipt'><h2>SECURE TECH SOLUTIONS</h2><p>Ruiru Town, Kiambu · +254 700 000 000</p><hr><p><b>Receipt:</b> {receipt}<br><b>Date:</b> {sale['created_at']}<br><b>Customer:</b> {html.escape(sale['customer_name'])}<br><b>Payment:</b> {sale['payment_method']}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing SECURE TECH SOLUTIONS.</p></div>"""
 
 
+firebase_firestore_client()
 setup_database()
 
 if "user" not in st.session_state:
     requested_pharmacy = login_pharmacy()
-    login_name = requested_pharmacy["name"] if requested_pharmacy else "Eashers Pharmacy"
+    login_name = requested_pharmacy["name"] if requested_pharmacy else "SecureTech Slns"
     st.markdown(f"<div class='hero'><div class='section-kicker' style='color:#9ce3ca'>Secure pharmacy operations</div><h1>Welcome to {html.escape(login_name)}.</h1><p>Sign in to manage stock, sales, suppliers, and reports.</p></div>", unsafe_allow_html=True)
     with st.form("login_form"):
         username = st.text_input("Username")
@@ -477,7 +675,7 @@ h1,h2,h3 { font-family:'Space Grotesk',sans-serif; letter-spacing:0; }
 
 
 with st.sidebar:
-    st.markdown("<div class='brand'><small>Pharmacy operations</small><h2>MediShelf</h2></div>", unsafe_allow_html=True)
+    st.markdown("<div class='brand'><small>Pharmacy operations</small><h2>SECURE TECH SOLUTIONS</h2></div>", unsafe_allow_html=True)
     allowed_pages = ["Dashboard", "Point of Sale", "Daily Sales", "Inventory & Stock", "Suppliers", "Audit Log"]
     if admin_access:
         allowed_pages.append("Members")
@@ -591,7 +789,7 @@ elif page == "Inventory & Stock":
         st.caption("Download the exact template, add or edit rows, then upload it. Existing product codes are updated and new codes are added automatically.")
         excel_left, excel_right = st.columns(2)
         with excel_left:
-            st.download_button("Download inventory Excel template", inventory_excel_bytes(), "eashers_inventory_template.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button("Download inventory Excel template", inventory_excel_bytes(), "securetechslns_inventory_template.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         with excel_right:
             inventory_upload = st.file_uploader("Upload completed inventory Excel", type=["xlsx"], key="inventory_excel_upload")
             if inventory_upload is not None and st.button("Accept Excel and update stock", type="primary", use_container_width=True):
@@ -633,8 +831,8 @@ elif page == "Daily Sales":
     selected_date = st.date_input("Sales date", value=date.today())
     sales_where, sales_params = pharmacy_scope("sales")
     sales_sql = "SELECT receipt_no, created_at, customer_name, payment_method, subtotal, discount, total, cashier FROM sales"
-    sales_sql += sales_where + (" AND " if sales_where else " WHERE ") + "date(created_at)=? ORDER BY created_at DESC"
-    sales = pd.read_sql_query(sales_sql, db(), params=sales_params + (selected_date.isoformat(),))
+    sales_sql += sales_where + (" AND " if sales_where else " WHERE ") + "CAST(created_at AS DATE)=CAST(? AS DATE) ORDER BY created_at DESC"
+    sales = pd.read_sql_query(sql_for_backend(sales_sql), db(), params=sales_params + (selected_date.isoformat(),))
     st.metric("Revenue", money(sales.total.sum() if not sales.empty else 0)); st.dataframe(sales.rename(columns={"receipt_no":"Receipt","created_at":"Date & time","customer_name":"Customer","payment_method":"Payment","subtotal":"Subtotal","discount":"Discount","total":"Total","cashier":"Cashier"}), use_container_width=True, hide_index=True)
     st.download_button("Export daily sales Excel", dataframe_excel_bytes(sales, "Daily Sales"), f"sales-{selected_date.isoformat()}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -658,13 +856,15 @@ elif page == "Suppliers":
             add_audit("Supplier added", "Suppliers", f"Added {supplier_name.strip()}"); st.success("Supplier added."); st.rerun()
         except sqlite3.IntegrityError: st.error("That supplier already exists.")
     suppliers_where, suppliers_params = pharmacy_scope()
-    suppliers = pd.read_sql_query(f"SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers{suppliers_where} ORDER BY name", db(), params=suppliers_params)
+    suppliers_sql = f"SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers{suppliers_where} ORDER BY name"
+    suppliers = pd.read_sql_query(sql_for_backend(suppliers_sql), db(), params=suppliers_params)
     st.dataframe(suppliers.rename(columns={"name":"Supplier","contact_person":"Contact","phone":"Phone","email":"Email","lead_time_days":"Lead days","payment_terms":"Terms"}), use_container_width=True, hide_index=True)
 
 elif page == "Audit Log":
     header("Traceability", "System activity.", "A searchable record of stock, sales, products, and supplier changes.")
     audit_where, audit_params = pharmacy_scope()
-    audit = pd.read_sql_query(f"SELECT created_at, action_type, entity, details, performed_by FROM audit_log{audit_where} ORDER BY id DESC", db(), params=audit_params)
+    audit_sql = f"SELECT created_at, action_type, entity, details, performed_by FROM audit_log{audit_where} ORDER BY id DESC"
+    audit = pd.read_sql_query(sql_for_backend(audit_sql), db(), params=audit_params)
     st.dataframe(audit.rename(columns={"created_at":"Date & time","action_type":"Action","entity":"Entity","details":"Details","performed_by":"Performed by"}), use_container_width=True, hide_index=True)
     st.download_button("Export audit log Excel", dataframe_excel_bytes(audit, "Audit Log"), "audit-log.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -689,7 +889,7 @@ elif page == "Pharmacies":
                 st.caption("Share this link with the pharmacy administrator. They will see this pharmacy name on the login screen.")
             except sqlite3.IntegrityError:
                 st.error("The pharmacy name or admin username already exists.")
-    pharmacies = pd.read_sql_query("SELECT id,name,location,active,created_at FROM pharmacies ORDER BY name", db())
+    pharmacies = pd.read_sql_query(sql_for_backend("SELECT id,name,location,active,created_at FROM pharmacies ORDER BY name"), db())
     st.dataframe(pharmacies.drop(columns=["id"]).rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
     st.markdown("#### Pharmacy login links")
     for pharmacy in pharmacies.itertuples():
@@ -721,7 +921,8 @@ elif page == "Members":
             except sqlite3.IntegrityError:
                 st.error("That username already exists.")
     members_where, members_params = pharmacy_scope()
-    members = pd.read_sql_query(f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{members_where} ORDER BY username", db(), params=members_params)
+    members_sql = f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{members_where} ORDER BY username"
+    members = pd.read_sql_query(sql_for_backend(members_sql), db(), params=members_params)
     st.dataframe(members.rename(columns={"username":"Username","role":"Role","active":"Active","can_manage_inventory":"Inventory rights","can_manage_suppliers":"Supplier rights","can_view_reports":"Report rights","can_view_audit":"Audit rights","created_at":"Created"}), use_container_width=True, hide_index=True)
     st.markdown("#### Reset a user password")
     reset_where, reset_params = pharmacy_scope("u")
