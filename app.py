@@ -7,8 +7,11 @@ import json
 import logging
 import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 try:
@@ -77,7 +80,7 @@ class DatabaseConnection:
         self.raw.close()
         self.has_writes = False
         if should_sync:
-            sync_firebase_outbox()
+            schedule_firebase_sync(force=True)
         return False
 
     def execute(self, sql: str, params: tuple = ()):
@@ -97,7 +100,7 @@ class DatabaseConnection:
         should_sync = self.has_writes
         self.has_writes = False
         if should_sync:
-            sync_firebase_outbox()
+            schedule_firebase_sync(force=True)
 
     def rollback(self):
         self.raw.rollback()
@@ -209,6 +212,9 @@ def setup_firestore_mirror(connection: DatabaseConnection) -> None:
             ELSE
                 row_data := to_jsonb(NEW);
             END IF;
+            IF TG_TABLE_NAME = 'users' THEN
+                row_data := row_data - 'password_hash';
+            END IF;
             INSERT INTO securetech_firestore_outbox(table_name, record_id, operation, payload)
             VALUES (TG_TABLE_NAME, row_data ->> 'id', TG_OP, row_data);
             IF TG_OP = 'DELETE' THEN
@@ -231,26 +237,28 @@ def setup_firestore_mirror(connection: DatabaseConnection) -> None:
 
     snapshot = connection.execute(
         "INSERT INTO securetech_firestore_sync_state(name) VALUES(%s) ON CONFLICT DO NOTHING RETURNING name",
-        ("initial_snapshot",),
+        ("initial_snapshot_v2",),
     ).fetchone()
     if snapshot:
         for table_name in FIRESTORE_MIRROR_TABLES:
             connection.execute(
                 f"""
                 INSERT INTO securetech_firestore_outbox(table_name,record_id,operation,payload)
-                SELECT %s, id::TEXT, 'UPSERT', to_jsonb(source) FROM {table_name} AS source
+                SELECT %s, id::TEXT, 'UPSERT',
+                    CASE WHEN %s = 'users' THEN to_jsonb(source) - 'password_hash' ELSE to_jsonb(source) END
+                FROM {table_name} AS source
                 """,
-                (table_name,),
+                (table_name, table_name),
             )
 
 
-def sync_firebase_outbox(batch_size: int = 400) -> int:
+def sync_firebase_outbox(client=None, batch_size: int = 400) -> int:
     if DB_BACKEND != "postgres" or psycopg2 is None:
         return 0
     raw_connection = None
     synced = 0
     try:
-        client = firebase_firestore_client()
+        client = client or firebase_firestore_client()
         raw_connection = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
         while True:
             with raw_connection:
@@ -283,8 +291,6 @@ def sync_firebase_outbox(batch_size: int = 400) -> int:
                             batch.delete(document)
                             continue
                         payload = dict(row["payload"] or {})
-                        if table_name == "users":
-                            payload.pop("password_hash", None)
                         batch.set(document, payload)
 
                     batch.commit()
@@ -293,15 +299,62 @@ def sync_firebase_outbox(batch_size: int = 400) -> int:
                         (outbox_ids,),
                     )
                     synced += len(rows)
+                    LOGGER.info("Mirrored %s PostgreSQL changes to Firestore.", len(rows))
         return synced
     except Exception:
         if raw_connection is not None:
             raw_connection.rollback()
         LOGGER.exception("Firestore mirror sync failed; changes remain queued in Supabase.")
-        return synced
+        return -1
     finally:
         if raw_connection is not None:
             raw_connection.close()
+
+
+class FirestoreSyncWorker:
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="firestore-sync")
+        self.lock = Lock()
+        self.running = False
+        self.requested = False
+        self.last_started = 0.0
+
+    def schedule(self, client, force: bool = False) -> None:
+        with self.lock:
+            if self.running:
+                self.requested = True
+                return
+            if not force and monotonic() - self.last_started < 30:
+                return
+            self.running = True
+            self.last_started = monotonic()
+        self.executor.submit(self._drain, client)
+
+    def _drain(self, client) -> None:
+        while True:
+            result = sync_firebase_outbox(client=client)
+            with self.lock:
+                if result < 0:
+                    self.running = False
+                    self.requested = False
+                    return
+                if self.requested:
+                    self.requested = False
+                    continue
+                self.running = False
+                return
+
+
+@st.cache_resource(show_spinner=False)
+def firestore_sync_worker() -> FirestoreSyncWorker:
+    return FirestoreSyncWorker()
+
+
+def schedule_firebase_sync(force: bool = False) -> None:
+    try:
+        firestore_sync_worker().schedule(firebase_firestore_client(), force=force)
+    except Exception:
+        LOGGER.exception("Could not schedule the Firestore mirror; changes remain queued in Supabase.")
 
 
 def now_text() -> str:
