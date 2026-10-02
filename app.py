@@ -686,7 +686,12 @@ def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admi
 @st.cache_data(ttl=15, max_entries=64)
 def load_products_for_scope(where: str, params: tuple) -> pd.DataFrame:
     sql = f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name"
-    return pd.DataFrame.from_records(dict(row) for row in query(sql, params))
+    rows = [dict(row) for row in query(sql, params)]
+    return pd.DataFrame.from_records(rows, columns=[
+        "id", "product_code", "name", "category", "supplier_id", "batch_no", "expiry_date",
+        "initial_stock", "quantity_sold", "current_stock", "reorder_level", "unit_cost",
+        "selling_price", "created_at", "updated_at", "pharmacy_id", "supplier",
+    ])
 
 
 @st.cache_data(ttl=30, max_entries=8)
@@ -702,7 +707,10 @@ def load_supplier_options(where: str, params: tuple) -> list[dict]:
 @st.cache_data(ttl=15, max_entries=64)
 def load_supplier_directory(where: str, params: tuple) -> pd.DataFrame:
     sql = f"SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers{where} ORDER BY name"
-    return pd.DataFrame.from_records(dict(row) for row in query(sql, params))
+    rows = [dict(row) for row in query(sql, params)]
+    return pd.DataFrame.from_records(rows, columns=[
+        "name", "contact_person", "phone", "email", "lead_time_days", "payment_terms",
+    ])
 
 
 @st.cache_data(ttl=15, max_entries=64)
@@ -715,7 +723,10 @@ def load_dashboard_sales(where: str, params: tuple) -> dict:
 def load_daily_sales(where: str, params: tuple, selected_date: str) -> pd.DataFrame:
     sql = "SELECT receipt_no, created_at, customer_name, payment_method, subtotal, discount, total, cashier FROM sales"
     sql += where + (" AND " if where else " WHERE ") + "CAST(created_at AS DATE)=CAST(? AS DATE) ORDER BY created_at DESC"
-    return pd.DataFrame.from_records(dict(row) for row in query(sql_for_backend(sql), params + (selected_date,)))
+    rows = [dict(row) for row in query(sql_for_backend(sql), params + (selected_date,))]
+    return pd.DataFrame.from_records(rows, columns=[
+        "receipt_no", "created_at", "customer_name", "payment_method", "subtotal", "discount", "total", "cashier",
+    ])
 
 
 def load_products() -> pd.DataFrame:
@@ -1201,6 +1212,9 @@ elif page == "Inventory & Stock":
         with product_form:
             supplier_where, supplier_params = pharmacy_scope()
             supplier_rows = load_supplier_options(supplier_where, supplier_params)
+            if not supplier_rows:
+                supplier_rows = [{"id": None, "name": "Unassigned"}]
+                st.caption("No suppliers yet. This product will be saved as Unassigned until a supplier is added.")
             with st.form("new_product"):
                 a, b, c = st.columns(3)
                 with a: code = st.text_input("Product code *"); name = st.text_input("Drug name *"); category = st.text_input("Category", value="Medicine")
