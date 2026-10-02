@@ -688,11 +688,14 @@ def dataframe_excel_bytes(frame: pd.DataFrame, sheet_name: str = "Report") -> by
 def receipt_excel_bytes(receipt: str) -> bytes:
     sale = query("SELECT * FROM sales WHERE receipt_no=?", (receipt,))[0]
     items = query("SELECT si.quantity, si.unit_price, si.line_total, p.name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=?", (sale["id"],))
+    receipt_datetime = sale["created_at"]
+    if isinstance(receipt_datetime, datetime) and receipt_datetime.tzinfo is not None:
+        receipt_datetime = receipt_datetime.replace(tzinfo=None)
     rows = pd.DataFrame([{
         "Product Name": item["name"], "Quantity": item["quantity"], "Unit Price (KSh)": item["unit_price"], "Line Total (KSh)": item["line_total"],
     } for item in items])
     summary = pd.DataFrame([
-        {"Field": "Receipt No", "Value": sale["receipt_no"]}, {"Field": "Date & Time", "Value": sale["created_at"]},
+        {"Field": "Receipt No", "Value": sale["receipt_no"]}, {"Field": "Date & Time", "Value": receipt_datetime},
         {"Field": "Customer", "Value": sale["customer_name"]}, {"Field": "Payment Method", "Value": sale["payment_method"]},
         {"Field": "Cashier", "Value": sale["cashier"]}, {"Field": "Subtotal (KSh)", "Value": sale["subtotal"]},
         {"Field": "Discount (KSh)", "Value": sale["discount"]}, {"Field": "Grand Total (KSh)", "Value": sale["total"]},
