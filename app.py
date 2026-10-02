@@ -1004,7 +1004,12 @@ def create_sale(cart: list[dict], customer: str, payment: str, discount: float, 
 
 @st.cache_data(ttl=600, max_entries=128)
 def receipt_data(receipt: str) -> tuple[dict, list[dict]]:
-    sale = query("SELECT * FROM sales WHERE receipt_no=?", (receipt,))[0]
+    sale = query(
+        "SELECT s.*, COALESCE(NULLIF(p.name,''),'SecureTech Slns') AS pharmacy_name, "
+        "COALESCE(p.location,'') AS pharmacy_location FROM sales s "
+        "LEFT JOIN pharmacies p ON p.id=s.pharmacy_id WHERE s.receipt_no=?",
+        (receipt,),
+    )[0]
     items = query("SELECT si.*, p.name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=?", (sale["id"],))
     return dict(sale), [dict(item) for item in items]
 
@@ -1012,7 +1017,10 @@ def receipt_data(receipt: str) -> tuple[dict, list[dict]]:
 def receipt_html(receipt: str) -> str:
     sale, items = receipt_data(receipt)
     rows = "".join(f"<tr><td>{html.escape(str(item['name']))}</td><td>{item['quantity']:g}</td><td>{money(item['line_total'])}</td></tr>" for item in items)
-    return f"""<div class='receipt'><h2>SECURE TECH SOLUTIONS</h2><p>Ruiru Town, Kiambu · +254 700 000 000</p><hr><p><b>Receipt:</b> {html.escape(str(receipt))}<br><b>Date:</b> {html.escape(str(sale['created_at']))}<br><b>Customer:</b> {html.escape(str(sale['customer_name']))}<br><b>Payment:</b> {html.escape(str(sale['payment_method']))}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing SECURE TECH SOLUTIONS.</p></div>"""
+    pharmacy_name = html.escape(str(sale["pharmacy_name"]))
+    pharmacy_location = html.escape(str(sale["pharmacy_location"]))
+    location_line = f"<p>{pharmacy_location}</p>" if pharmacy_location else ""
+    return f"""<div class='receipt'><h2>{pharmacy_name}</h2>{location_line}<hr><p><b>Receipt:</b> {html.escape(str(receipt))}<br><b>Date:</b> {html.escape(str(sale['created_at']))}<br><b>Customer:</b> {html.escape(str(sale['customer_name']))}<br><b>Payment:</b> {html.escape(str(sale['payment_method']))}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing {pharmacy_name}.</p></div>"""
 
 
 def receipt_print_document(receipt: str) -> str:
@@ -1021,7 +1029,7 @@ def receipt_print_document(receipt: str) -> str:
 
 def receipt_plain_text(receipt: str) -> str:
     sale, items = receipt_data(receipt)
-    lines = ["SECURE TECH SOLUTIONS", f"Receipt: {receipt}", f"Date: {sale['created_at']}", f"Customer: {sale['customer_name']}", f"Payment: {sale['payment_method']}", ""]
+    lines = [str(sale["pharmacy_name"]), str(sale["pharmacy_location"]), f"Receipt: {receipt}", f"Date: {sale['created_at']}", f"Customer: {sale['customer_name']}", f"Payment: {sale['payment_method']}", ""]
     lines.extend(f"{item['name']} x {item['quantity']:g}: {money(item['line_total'])}" for item in items)
     lines.extend(("", f"Subtotal: {money(sale['subtotal'])}", f"Discount: {money(sale['discount'])}", f"Total: {money(sale['total'])}"))
     return "\n".join(lines)
@@ -1049,7 +1057,8 @@ def send_receipt_email(receipt: str, email_address: str) -> None:
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", destination): raise ValueError("Enter a valid email address.")
     if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
         raise RuntimeError("Email sending is not configured. Add SENDGRID_API_KEY and SENDGRID_FROM_EMAIL in Render Environment settings.")
-    payload = json.dumps({"personalizations": [{"to": [{"email": destination}]}], "from": {"email": SENDGRID_FROM_EMAIL}, "subject": f"SecureTech receipt {receipt}", "content": [{"type": "text/html", "value": receipt_print_document(receipt)}]}).encode("utf-8")
+    sale, _ = receipt_data(receipt)
+    payload = json.dumps({"personalizations": [{"to": [{"email": destination}]}], "from": {"email": SENDGRID_FROM_EMAIL}, "subject": f"{sale['pharmacy_name']} receipt {receipt}", "content": [{"type": "text/html", "value": receipt_print_document(receipt)}]}).encode("utf-8")
     request = Request("https://api.sendgrid.com/v3/mail/send", data=payload, headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"}, method="POST")
     try:
         with urlopen(request, timeout=20) as response:
