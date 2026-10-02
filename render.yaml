@@ -9,3 +9,7 @@ services:
     envVars:
       - key: SUPABASE_DATABASE_URL
         sync: false
+      - key: BOOTSTRAP_ADMIN_USERNAME
+        sync: false
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false

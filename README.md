@@ -30,6 +30,9 @@ SUPABASE_DATABASE_URL=postgresql://postgres:your-password@db.project-ref.supabas
 
 Get the connection string from your Supabase project's **Connect** panel. Enter it as `SUPABASE_DATABASE_URL` in Render's Environment settings. The app uses this Supabase PostgreSQL database for pharmacy, inventory, sales, and user records; Firebase is required for audit-event storage. Local SQLite and Render-managed Postgres are not used as fallbacks.
 
+### Initial administrator
+When the `users` table is empty, set `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` in the hosting environment before starting the app. Use a unique password of at least 16 characters and store it as a secret; do not put it in source code or this README. These values are used only to create the first super-admin and do not reset existing accounts. On Render, configure both variables under the service's Environment settings. Existing deployments with users already in Supabase do not need them.
+
 ## Modules
 
 - Dashboard: inventory value, today's revenue, low-stock queue, expiry watch, and stock charts.
@@ -38,7 +41,7 @@ Get the connection string from your Supabase project's **Connect** panel. Enter 
 - Daily Sales: date-based transaction log and revenue export.
 - Suppliers: contacts, lead times, and payment terms.
 - Audit Log: traceable product, supplier, and sale activity.
-- Login and permissions: administrator `Stephen` with password `Stephen@12k`; members can be created as sales-only users with optional rights.
+- Login and permissions: the initial administrator is configured through bootstrap environment secrets; members can be created as sales-only users with optional rights.
 - Dashboard data refreshes every 60 seconds while the dashboard is open; other pages rerun only when interacted with. Audit entries record the signed-in user and event time.
 - Excel stock exchange: download the canonical inventory workbook, edit it, and upload it to add products or update stock by Product ID. The sheet uses exactly: Product ID, Product Name, Supplier Name, Batch No, Expiry Date, Initial Stock, QTY Sold, Current Stock, Reorder Level, Unit Cost (KSh), Total Cost (KSh), Markup %, Selling Price (KSh), Expiry Status, Stock Status.
 - All extracted reports are Excel workbooks: inventory, daily sales, audit log, and receipts.

@@ -44,6 +44,8 @@ FIREBASE_CLIENT_EMAIL = os.getenv("FIREBASE_CLIENT_EMAIL")
 FIREBASE_PRIVATE_KEY = (os.getenv("FIREBASE_PRIVATE_KEY") or "").replace("\\n", "\n")
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 FIREBASE_SERVICE_ACCOUNT_FILE = Path(os.getenv("FIREBASE_SERVICE_ACCOUNT_FILE", "/etc/secrets/firebase-service-account.json"))
+BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip()
+BOOTSTRAP_ADMIN_PASSWORD = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
 CURRENCY = "KSh"
 EAT = ZoneInfo("Africa/Nairobi")
 INVENTORY_EXCEL_COLUMNS = [
@@ -548,11 +550,15 @@ def setup_database_postgres() -> None:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN pharmacy_id INTEGER")
             connection.execute(f"UPDATE {table} SET pharmacy_id=%s WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
         setup_firestore_mirror(connection)
-        connection.execute("UPDATE users SET role='super_admin', pharmacy_id=NULL WHERE username='Stephen'")
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            if not BOOTSTRAP_ADMIN_USERNAME or len(BOOTSTRAP_ADMIN_PASSWORD) < 16:
+                raise RuntimeError(
+                    "No administrator exists. Set BOOTSTRAP_ADMIN_USERNAME and "
+                    "a unique BOOTSTRAP_ADMIN_PASSWORD of at least 16 characters, then restart."
+                )
             connection.execute(
                 "INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                ("Stephen", password_hash("Stephen@12k"), "super_admin", 1, 1, 1, 1, now_text(), None),
+                (BOOTSTRAP_ADMIN_USERNAME, password_hash(BOOTSTRAP_ADMIN_PASSWORD), "super_admin", 1, 1, 1, 1, now_text(), None),
             )
         if connection.execute("SELECT COUNT(*) FROM suppliers").fetchone()[0] == 0:
             suppliers = [
