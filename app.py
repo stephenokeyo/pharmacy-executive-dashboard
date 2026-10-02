@@ -681,6 +681,7 @@ def query(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admin") -> None:
     with db() as connection:
         connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, now_text(), write_pharmacy_id()))
+    load_audit_log.clear()
 
 
 @st.cache_data(ttl=15, max_entries=64)
@@ -697,6 +698,26 @@ def load_products_for_scope(where: str, params: tuple) -> pd.DataFrame:
 @st.cache_data(ttl=30, max_entries=8)
 def load_active_pharmacies() -> list[dict]:
     return [dict(row) for row in query("SELECT id,name FROM pharmacies WHERE active=1 ORDER BY name")]
+
+
+@st.cache_data(ttl=30, max_entries=8)
+def load_pharmacy_directory() -> pd.DataFrame:
+    rows = [dict(row) for row in query("SELECT id,name,location,active,created_at FROM pharmacies ORDER BY name")]
+    return pd.DataFrame.from_records(rows, columns=["id", "name", "location", "active", "created_at"])
+
+
+@st.cache_data(ttl=15, max_entries=64)
+def load_audit_log(where: str, params: tuple) -> pd.DataFrame:
+    sql = f"SELECT created_at, action_type, entity, details, performed_by FROM audit_log{where} ORDER BY id DESC"
+    rows = [dict(row) for row in query(sql_for_backend(sql), params)]
+    return pd.DataFrame.from_records(rows, columns=["created_at", "action_type", "entity", "details", "performed_by"])
+
+
+@st.cache_data(ttl=15, max_entries=64)
+def load_members(where: str, params: tuple) -> pd.DataFrame:
+    sql = f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{where} ORDER BY username"
+    rows = [dict(row) for row in query(sql_for_backend(sql), params)]
+    return pd.DataFrame.from_records(rows, columns=["username", "role", "active", "can_manage_inventory", "can_manage_suppliers", "can_view_reports", "can_view_audit", "created_at"])
 
 
 @st.cache_data(ttl=15, max_entries=64)
@@ -868,29 +889,67 @@ def import_inventory_excel(content: bytes, performed_by: str) -> tuple[int, int]
         raise ValueError(f"Every product row must have Product ID and Product Name. Check Excel row(s): {rows}")
     if uploaded.empty:
         raise ValueError("The Excel sheet does not contain any product rows.")
+    duplicate_ids = uploaded["Product ID"].duplicated(keep=False)
+    if duplicate_ids.any():
+        product_ids = ", ".join(uploaded.loc[duplicate_ids, "Product ID"].drop_duplicates().head(10))
+        raise ValueError(f"Duplicate Product ID values found in the workbook: {product_ids}")
     for column in ["Initial Stock", "QTY Sold", "Reorder Level", "Unit Cost (KSh)", "Total Cost (KSh)", "Markup %", "Selling Price (KSh)"]:
         uploaded[column] = pd.to_numeric(uploaded[column], errors="coerce").fillna(0)
     uploaded["Current Stock"] = pd.to_numeric(uploaded["Current Stock"], errors="coerce")
     uploaded["Current Stock"] = uploaded["Current Stock"].fillna(uploaded["Initial Stock"] - uploaded["QTY Sold"])
     uploaded["Expiry Date"] = pd.to_datetime(uploaded["Expiry Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    inserted = updated = 0
+    uploaded["Supplier Name"] = uploaded["Supplier Name"].fillna("Unassigned").astype(str).str.strip().replace("", "Unassigned")
+    pharmacy_id = write_pharmacy_id()
+    supplier_names = uploaded["Supplier Name"].drop_duplicates().tolist()
+    product_rows = []
+    timestamp = now_text()
     with db() as connection:
+        supplier_rows = [(name, timestamp, pharmacy_id) for name in supplier_names]
+        for offset in range(0, len(supplier_rows), 400):
+            batch = supplier_rows[offset:offset + 400]
+            value_groups = ",".join("(?,?,?)" for _ in batch)
+            connection.execute(
+                f"INSERT INTO suppliers(name,created_at,pharmacy_id) VALUES {value_groups} ON CONFLICT(name,pharmacy_id) DO NOTHING",
+                tuple(value for row in batch for value in row),
+            )
+        supplier_placeholders = ",".join("?" for _ in supplier_names)
+        suppliers = connection.execute(
+            f"SELECT id,name FROM suppliers WHERE pharmacy_id=? AND name IN ({supplier_placeholders})",
+            (pharmacy_id, *supplier_names),
+        ).fetchall()
+        supplier_ids = {row["name"]: row["id"] for row in suppliers}
+        product_codes = uploaded["Product ID"].tolist()
+        existing_rows = connection.execute(
+            "SELECT product_code FROM products WHERE pharmacy_id=? AND product_code = ANY(?)",
+            (pharmacy_id, product_codes),
+        ).fetchall()
+        existing_codes = {row["product_code"] for row in existing_rows}
+        seen_codes = set(existing_codes)
+        inserted = updated = 0
         for row in uploaded.to_dict("records"):
-            supplier_name = "Unassigned" if pd.isna(row["Supplier Name"]) else str(row["Supplier Name"]).strip() or "Unassigned"
-            supplier = connection.execute("SELECT id FROM suppliers WHERE name=? AND pharmacy_id=?", (supplier_name, write_pharmacy_id())).fetchone()
-            if not supplier:
-                supplier = connection.execute("INSERT INTO suppliers(name,created_at,pharmacy_id) VALUES(?,?,?) RETURNING id", (supplier_name, now_text(), write_pharmacy_id())).fetchone()
-                supplier_id = supplier["id"]
-            else:
-                supplier_id = supplier["id"]
-            values = (row["Product Name"], "Medicine", supplier_id, row["Batch No"] or "N/A", row["Expiry Date"], row["Initial Stock"], row["QTY Sold"], row["Current Stock"], row["Reorder Level"], row["Unit Cost (KSh)"], row["Selling Price (KSh)"], now_text(), row["Product ID"])
-            existing = connection.execute("SELECT id FROM products WHERE product_code=? AND pharmacy_id=?", (row["Product ID"], write_pharmacy_id())).fetchone()
-            if existing:
-                connection.execute("UPDATE products SET name=?,category=?,supplier_id=?,batch_no=?,expiry_date=?,initial_stock=?,quantity_sold=?,current_stock=?,reorder_level=?,unit_cost=?,selling_price=?,updated_at=? WHERE product_code=? AND pharmacy_id=?", values + (write_pharmacy_id(),))
+            code = row["Product ID"]
+            if code in seen_codes:
                 updated += 1
             else:
-                connection.execute("INSERT INTO products(name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,updated_at,product_code,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values[:-1] + (row["Product ID"], now_text(), write_pharmacy_id()))
                 inserted += 1
+                seen_codes.add(code)
+            product_rows.append((
+                code, row["Product Name"], "Medicine", supplier_ids[row["Supplier Name"]],
+                row["Batch No"] or "N/A", row["Expiry Date"], row["Initial Stock"],
+                row["QTY Sold"], row["Current Stock"], row["Reorder Level"],
+                row["Unit Cost (KSh)"], row["Selling Price (KSh)"], timestamp, timestamp, pharmacy_id,
+            ))
+
+        product_columns = "product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at,pharmacy_id"
+        update_columns = "name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,updated_at"
+        for offset in range(0, len(product_rows), 400):
+            batch = product_rows[offset:offset + 400]
+            value_groups = ",".join("(" + ",".join("?" for _ in row) + ")" for row in batch)
+            update_clause = ",".join(f"{column}=EXCLUDED.{column}" for column in update_columns.split(","))
+            connection.execute(
+                f"INSERT INTO products({product_columns}) VALUES {value_groups} ON CONFLICT(product_code,pharmacy_id) DO UPDATE SET {update_clause}",
+                tuple(value for row in batch for value in row),
+            )
     add_audit("Inventory Excel imported", "Inventory", f"Accepted {inserted} new and {updated} updated rows", performed_by)
     load_products_for_scope.clear()
     load_supplier_options.clear()
@@ -1270,8 +1329,7 @@ elif page == "Suppliers":
 elif page == "Audit Log":
     header("Traceability", "System activity.", "A searchable record of stock, sales, products, and supplier changes.")
     audit_where, audit_params = pharmacy_scope()
-    audit_sql = f"SELECT created_at, action_type, entity, details, performed_by FROM audit_log{audit_where} ORDER BY id DESC"
-    audit = pd.read_sql_query(sql_for_backend(audit_sql), db(), params=audit_params)
+    audit = load_audit_log(audit_where, audit_params)
     st.dataframe(audit.rename(columns={"created_at":"Date & time","action_type":"Action","entity":"Entity","details":"Details","performed_by":"Performed by"}), use_container_width=True, hide_index=True)
     st.download_button("Export audit log Excel", dataframe_excel_bytes(audit, "Audit Log"), "audit-log.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -1293,12 +1351,13 @@ elif page == "Pharmacies":
                     pharmacy_id = pharmacy["id"]
                     connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (admin_name.strip(), password_hash(admin_password), "admin", 1, 1, 1, 1, now_text(), pharmacy_id))
                 load_active_pharmacies.clear()
+                load_pharmacy_directory.clear()
                 st.success(f"Created {pharmacy_name.strip()} with admin {admin_name.strip()}.")
                 st.markdown(f"**Pharmacy login link:** [Open {html.escape(pharmacy_name.strip())} login](?pharmacy={pharmacy_id})")
                 st.caption("Share this link with the pharmacy administrator. They will see this pharmacy name on the login screen.")
             except sqlite3.IntegrityError:
                 st.error("The pharmacy name or admin username already exists.")
-    pharmacies = pd.read_sql_query(sql_for_backend("SELECT id,name,location,active,created_at FROM pharmacies ORDER BY name"), db())
+    pharmacies = load_pharmacy_directory()
     st.dataframe(pharmacies.drop(columns=["id"]).rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
     st.markdown("#### Pharmacy login links")
     for pharmacy in pharmacies.itertuples():
@@ -1325,13 +1384,13 @@ elif page == "Members":
             try:
                 with db() as connection:
                     connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (member_name.strip(), password_hash(member_password), "member", int(manage_inventory), int(manage_suppliers), int(view_reports), int(view_audit), now_text(), write_pharmacy_id()))
+                load_members.clear()
                 add_audit("Member added", "Users", f"Created member account {member_name.strip()}", current_user["username"])
                 st.success(f"Member {member_name.strip()} created."); st.rerun()
             except sqlite3.IntegrityError:
                 st.error("That username already exists.")
     members_where, members_params = pharmacy_scope()
-    members_sql = f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{members_where} ORDER BY username"
-    members = pd.read_sql_query(sql_for_backend(members_sql), db(), params=members_params)
+    members = load_members(members_where, members_params)
     st.dataframe(members.rename(columns={"username":"Username","role":"Role","active":"Active","can_manage_inventory":"Inventory rights","can_manage_suppliers":"Supplier rights","can_view_reports":"Report rights","can_view_audit":"Audit rights","created_at":"Created"}), use_container_width=True, hide_index=True)
     st.markdown("#### Reset a user password")
     reset_where, reset_params = pharmacy_scope("u")
