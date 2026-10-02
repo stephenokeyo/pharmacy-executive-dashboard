@@ -33,6 +33,12 @@ Get the connection string from your Supabase project's **Connect** panel. Enter 
 ### Initial administrator
 When the `users` table is empty, set `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` in the hosting environment before starting the app. Use a unique password of at least 16 characters and store it as a secret; do not put it in source code or this README. These values are used only to create the first super-admin and do not reset existing accounts. On Render, configure both variables under the service's Environment settings. Existing deployments with users already in Supabase do not need them.
 
+### Receipt delivery
+Print opens the browser's native print dialog, where the user can select any printer installed on their computer. For SMS delivery, configure `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM_NUMBER` as Render environment secrets. For email delivery, configure `SENDGRID_API_KEY` and a verified `SENDGRID_FROM_EMAIL`. Enter the recipient's phone number in international format (for example, `+254712345678`) or their email address on the POS receipt screen. Never commit provider credentials.
+
+### Data freshness and navigation
+Product lists, pharmacy choices, supplier lookups, dashboard totals, and daily sales use short-lived caches to make page navigation quicker. Cache entries are cleared after relevant product, supplier, pharmacy, and sale writes; checkout rechecks and locks current stock in Supabase before committing a sale.
+
 ## Modules
 
 - Dashboard: inventory value, today's revenue, low-stock queue, expiry watch, and stock charts.

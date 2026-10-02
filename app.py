@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import base64
 import html
 import hashlib
 import io
 import json
 import logging
 import os
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from email.utils import parseaddr
 from pathlib import Path
 from threading import Lock
 from time import monotonic
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 try:
@@ -46,6 +52,11 @@ FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 FIREBASE_SERVICE_ACCOUNT_FILE = Path(os.getenv("FIREBASE_SERVICE_ACCOUNT_FILE", "/etc/secrets/firebase-service-account.json"))
 BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip()
 BOOTSTRAP_ADMIN_PASSWORD = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "")
 CURRENCY = "KSh"
 EAT = ZoneInfo("Africa/Nairobi")
 INVENTORY_EXCEL_COLUMNS = [
@@ -57,6 +68,39 @@ FIRESTORE_MIRROR_TABLES = ("pharmacies", "suppliers", "products", "sales", "sale
 LOGGER = logging.getLogger(__name__)
 
 st.set_page_config(page_title="SecureTech Slns", page_icon="+", layout="wide", initial_sidebar_state="expanded")
+
+PRINT_RECEIPT = st.components.v2.component(
+        "securetech_receipt_print",
+        html='''<button type="button" aria-label="Print receipt">Print receipt</button>''',
+        css="""
+        button { border: 0; border-radius: 6px; background: #087f75; color: white; cursor: pointer; font: 600 14px sans-serif; padding: 10px 16px; }
+        button:hover { background: #06685f; }
+        """,
+        js="""
+        export default function (component) {
+            const { data, parentElement } = component
+            const button = parentElement.querySelector("button")
+            if (!button) return
+            const printReceipt = () => {
+                const printWindow = window.open("", "_blank", "width=800,height=700")
+                if (!printWindow) {
+                    button.textContent = "Allow pop-ups to print"
+                    return
+                }
+                printWindow.opener = null
+                printWindow.document.open()
+                printWindow.document.write(data.document)
+                printWindow.document.close()
+                window.setTimeout(() => {
+                    printWindow.focus()
+                    printWindow.print()
+                }, 250)
+            }
+            button.addEventListener("click", printReceipt)
+            return () => button.removeEventListener("click", printReceipt)
+        }
+        """,
+)
 
 
 class DatabaseConnection:
@@ -639,10 +683,39 @@ def add_audit(action: str, entity: str, details: str, user: str = "Pharmacy Admi
         connection.execute("INSERT INTO audit_log(action_type,entity,details,performed_by,created_at,pharmacy_id) VALUES(?,?,?,?,?,?)", (action, entity, details, user, now_text(), write_pharmacy_id()))
 
 
-@st.cache_data(ttl=5, max_entries=64)
+@st.cache_data(ttl=15, max_entries=64)
 def load_products_for_scope(where: str, params: tuple) -> pd.DataFrame:
     sql = f"SELECT p.*, COALESCE(s.name, 'Unassigned') AS supplier FROM products p LEFT JOIN suppliers s ON s.id = p.supplier_id{where} ORDER BY p.name"
     return pd.DataFrame.from_records(dict(row) for row in query(sql, params))
+
+
+@st.cache_data(ttl=30, max_entries=8)
+def load_active_pharmacies() -> list[dict]:
+    return [dict(row) for row in query("SELECT id,name FROM pharmacies WHERE active=1 ORDER BY name")]
+
+
+@st.cache_data(ttl=15, max_entries=64)
+def load_supplier_options(where: str, params: tuple) -> list[dict]:
+    return [dict(row) for row in query(f"SELECT id,name FROM suppliers{where} ORDER BY name", params)]
+
+
+@st.cache_data(ttl=15, max_entries=64)
+def load_supplier_directory(where: str, params: tuple) -> pd.DataFrame:
+    sql = f"SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers{where} ORDER BY name"
+    return pd.DataFrame.from_records(dict(row) for row in query(sql, params))
+
+
+@st.cache_data(ttl=15, max_entries=64)
+def load_dashboard_sales(where: str, params: tuple) -> dict:
+    sql = f"SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales{where} AND date(created_at)=date('now')" if where else "SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales WHERE date(created_at)=date('now')"
+    return dict(query(sql, params)[0])
+
+
+@st.cache_data(ttl=15, max_entries=64)
+def load_daily_sales(where: str, params: tuple, selected_date: str) -> pd.DataFrame:
+    sql = "SELECT receipt_no, created_at, customer_name, payment_method, subtotal, discount, total, cashier FROM sales"
+    sql += where + (" AND " if where else " WHERE ") + "CAST(created_at AS DATE)=CAST(? AS DATE) ORDER BY created_at DESC"
+    return pd.DataFrame.from_records(dict(row) for row in query(sql_for_backend(sql), params + (selected_date,)))
 
 
 def load_products() -> pd.DataFrame:
@@ -685,9 +758,9 @@ def dataframe_excel_bytes(frame: pd.DataFrame, sheet_name: str = "Report") -> by
     return output.getvalue()
 
 
+@st.cache_data(ttl=600, max_entries=128)
 def receipt_excel_bytes(receipt: str) -> bytes:
-    sale = query("SELECT * FROM sales WHERE receipt_no=?", (receipt,))[0]
-    items = query("SELECT si.quantity, si.unit_price, si.line_total, p.name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=?", (sale["id"],))
+    sale, items = receipt_data(receipt)
     receipt_datetime = sale["created_at"]
     if isinstance(receipt_datetime, datetime) and receipt_datetime.tzinfo is not None:
         receipt_datetime = receipt_datetime.replace(tzinfo=None)
@@ -808,6 +881,9 @@ def import_inventory_excel(content: bytes, performed_by: str) -> tuple[int, int]
                 connection.execute("INSERT INTO products(name,category,supplier_id,batch_no,expiry_date,initial_stock,quantity_sold,current_stock,reorder_level,unit_cost,selling_price,updated_at,product_code,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values[:-1] + (row["Product ID"], now_text(), write_pharmacy_id()))
                 inserted += 1
     add_audit("Inventory Excel imported", "Inventory", f"Accepted {inserted} new and {updated} updated rows", performed_by)
+    load_products_for_scope.clear()
+    load_supplier_options.clear()
+    load_supplier_directory.clear()
     return inserted, updated
 
 
@@ -826,6 +902,9 @@ def add_product(data: dict) -> None:
     with db() as connection:
         connection.execute("INSERT INTO products(product_code,name,category,supplier_id,batch_no,expiry_date,initial_stock,current_stock,reorder_level,unit_cost,selling_price,created_at,updated_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (data["code"], data["name"], data["category"], data["supplier_id"], data["batch"], data["expiry"], data["stock"], data["stock"], data["reorder"], data["cost"], data["price"], now_text(), now_text(), write_pharmacy_id()))
     add_audit("Product added", "Inventory", f"Added {data['code']} - {data['name']}")
+    load_products_for_scope.clear()
+    load_supplier_options.clear()
+    load_supplier_directory.clear()
 
 
 def create_sale(cart: list[dict], customer: str, payment: str, discount: float, cashier: str) -> tuple[str, float]:
@@ -834,20 +913,81 @@ def create_sale(cart: list[dict], customer: str, payment: str, discount: float, 
     current_time = datetime.now(EAT)
     receipt = f"POS-{current_time:%Y%m%d}-{current_time.microsecond // 1000:03d}"
     with db() as connection:
+        pharmacy_id = write_pharmacy_id()
+        for item in sorted(cart, key=lambda cart_item: int(cart_item["id"])):
+            product = connection.execute("SELECT current_stock,pharmacy_id FROM products WHERE id=? FOR UPDATE", (item["id"],)).fetchone()
+            if product is None or product["pharmacy_id"] != pharmacy_id:
+                raise ValueError(f"Product {item['name']} is no longer available in this pharmacy.")
+            if float(product["current_stock"]) < float(item["quantity"]):
+                raise ValueError(f"Not enough stock for {item['name']}. Available: {product['current_stock']:g}.")
         sale = connection.execute("INSERT INTO sales(receipt_no,customer_name,payment_method,subtotal,discount,total,cashier,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id", (receipt, customer, payment, subtotal, discount, total, cashier, now_text(), write_pharmacy_id())).fetchone()
         sale_id = sale["id"]
         for item in cart:
             connection.execute("INSERT INTO sale_items(sale_id,product_id,quantity,unit_price,line_total) VALUES(?,?,?,?,?)", (sale_id, item["id"], item["quantity"], item["unit_price"], item["quantity"] * item["unit_price"]))
             connection.execute("UPDATE products SET current_stock=current_stock-?, quantity_sold=quantity_sold+?, updated_at=? WHERE id=?", (item["quantity"], item["quantity"], now_text(), item["id"]))
     add_audit("Sale completed", receipt, f"{len(cart)} line items, total {money(total)}", cashier)
+    load_products_for_scope.clear()
+    load_dashboard_sales.clear()
+    load_daily_sales.clear()
     return receipt, total
 
 
-def receipt_html(receipt: str) -> str:
+@st.cache_data(ttl=600, max_entries=128)
+def receipt_data(receipt: str) -> tuple[dict, list[dict]]:
     sale = query("SELECT * FROM sales WHERE receipt_no=?", (receipt,))[0]
     items = query("SELECT si.*, p.name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=?", (sale["id"],))
-    rows = "".join(f"<tr><td>{html.escape(item['name'])}</td><td>{item['quantity']:g}</td><td>{money(item['line_total'])}</td></tr>" for item in items)
-    return f"""<div class='receipt'><h2>SECURE TECH SOLUTIONS</h2><p>Ruiru Town, Kiambu · +254 700 000 000</p><hr><p><b>Receipt:</b> {receipt}<br><b>Date:</b> {sale['created_at']}<br><b>Customer:</b> {html.escape(sale['customer_name'])}<br><b>Payment:</b> {sale['payment_method']}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing SECURE TECH SOLUTIONS.</p></div>"""
+    return dict(sale), [dict(item) for item in items]
+
+
+def receipt_html(receipt: str) -> str:
+    sale, items = receipt_data(receipt)
+    rows = "".join(f"<tr><td>{html.escape(str(item['name']))}</td><td>{item['quantity']:g}</td><td>{money(item['line_total'])}</td></tr>" for item in items)
+    return f"""<div class='receipt'><h2>SECURE TECH SOLUTIONS</h2><p>Ruiru Town, Kiambu · +254 700 000 000</p><hr><p><b>Receipt:</b> {html.escape(str(receipt))}<br><b>Date:</b> {html.escape(str(sale['created_at']))}<br><b>Customer:</b> {html.escape(str(sale['customer_name']))}<br><b>Payment:</b> {html.escape(str(sale['payment_method']))}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing SECURE TECH SOLUTIONS.</p></div>"""
+
+
+def receipt_print_document(receipt: str) -> str:
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Receipt {html.escape(str(receipt))}</title><style>body{{margin:0;padding:24px;color:#17282d;font:14px Arial,sans-serif}}.receipt{{max-width:520px;margin:auto}}h2{{text-align:center;margin:0}}p{{line-height:1.5}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px 4px;border-bottom:1px solid #ddd;text-align:left}}td:last-child,th:last-child{{text-align:right}}.total{{text-align:right;font-size:18px;font-weight:bold}}@media print{{body{{padding:0}}}}</style></head><body>{receipt_html(receipt)}</body></html>"""
+
+
+def receipt_plain_text(receipt: str) -> str:
+    sale, items = receipt_data(receipt)
+    lines = ["SECURE TECH SOLUTIONS", f"Receipt: {receipt}", f"Date: {sale['created_at']}", f"Customer: {sale['customer_name']}", f"Payment: {sale['payment_method']}", ""]
+    lines.extend(f"{item['name']} x {item['quantity']:g}: {money(item['line_total'])}" for item in items)
+    lines.extend(("", f"Subtotal: {money(sale['subtotal'])}", f"Discount: {money(sale['discount'])}", f"Total: {money(sale['total'])}"))
+    return "\n".join(lines)
+
+
+def send_receipt_sms(receipt: str, phone_number: str) -> None:
+    destination = phone_number.strip()
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", destination):
+        raise ValueError("Enter the mobile number in international format, for example +254712345678.")
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
+        raise RuntimeError("SMS sending is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER in Render Environment settings.")
+    token = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
+    request = Request(f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json", data=urlencode({"To": destination, "From": TWILIO_FROM_NUMBER, "Body": receipt_plain_text(receipt)}).encode("utf-8"), headers={"Authorization": f"Basic {token}", "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    try:
+        with urlopen(request, timeout=20) as response:
+            if response.status not in (200, 201): raise RuntimeError(f"SMS provider returned HTTP {response.status}.")
+    except HTTPError as error:
+        raise RuntimeError(f"SMS provider rejected the request (HTTP {error.code}). Check the Twilio account and sender number.") from None
+    except URLError:
+        raise RuntimeError("Could not connect to the SMS provider. Check the server network and try again.") from None
+
+
+def send_receipt_email(receipt: str, email_address: str) -> None:
+    destination = parseaddr(email_address.strip())[1]
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", destination): raise ValueError("Enter a valid email address.")
+    if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
+        raise RuntimeError("Email sending is not configured. Add SENDGRID_API_KEY and SENDGRID_FROM_EMAIL in Render Environment settings.")
+    payload = json.dumps({"personalizations": [{"to": [{"email": destination}]}], "from": {"email": SENDGRID_FROM_EMAIL}, "subject": f"SecureTech receipt {receipt}", "content": [{"type": "text/html", "value": receipt_print_document(receipt)}]}).encode("utf-8")
+    request = Request("https://api.sendgrid.com/v3/mail/send", data=payload, headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=20) as response:
+            if response.status != 202: raise RuntimeError(f"Email provider returned HTTP {response.status}.")
+    except HTTPError as error:
+        raise RuntimeError(f"Email provider rejected the request (HTTP {error.code}). Check the SendGrid account and sender verification.") from None
+    except URLError:
+        raise RuntimeError("Could not connect to the email provider. Check the server network and try again.") from None
 
 
 firebase_firestore_client()
@@ -906,7 +1046,7 @@ with st.sidebar:
         st_autorefresh(interval=60000, limit=None, key="dashboard_refresh")
     st.divider()
     if is_super_admin(current_user):
-        pharmacy_options = query("SELECT id,name FROM pharmacies WHERE active=1 ORDER BY name")
+        pharmacy_options = load_active_pharmacies()
         selected_name = st.selectbox("Manage pharmacy", [row["name"] for row in pharmacy_options], index=next((index for index, row in enumerate(pharmacy_options) if row["id"] == st.session_state.selected_pharmacy_id), 0))
         st.session_state.selected_pharmacy_id = next(row["id"] for row in pharmacy_options if row["name"] == selected_name)
     pharmacy_label = "All pharmacies" if is_super_admin(current_user) else current_user.get("pharmacy_name", "Assigned pharmacy")
@@ -926,7 +1066,7 @@ if page == "Dashboard":
     products = load_products()
     header("Executive view", "A clearer shelf, every day.", "Track stock health, revenue, expiry exposure, and the work that needs attention.")
     sales_where, sales_params = pharmacy_scope("sales")
-    sales = query(f"SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales{sales_where} AND date(created_at)=date('now')" if sales_where else "SELECT COALESCE(SUM(total),0) AS total, COUNT(*) AS count FROM sales WHERE date(created_at)=date('now')", sales_params)[0]
+    sales = load_dashboard_sales(sales_where, sales_params)
     metrics = [("Inventory value", money((products.current_stock * products.unit_cost).sum()), "current stock at cost"), ("Today's revenue", money(sales["total"]), f"{sales['count']} completed sales"), ("Low-stock items", f"{sum(status(r.current_stock, r.reorder_level) == 'LOW STOCK' for r in products.itertuples())}", "need replenishment"), ("Expiry watch", f"{sum(expiry_status(r.expiry_date) in ('EXPIRED','EXPIRING SOON') for r in products.itertuples())}", "expired or within 90 days")]
     columns = st.columns(4)
     for column, (label, value, note) in zip(columns, metrics):
@@ -992,16 +1132,47 @@ elif page == "Point of Sale":
             discount = st.number_input("Discount (KSh)", min_value=0.0, max_value=float(subtotal), step=10.0)
             st.metric("Grand total", money(subtotal - discount))
             if st.button("Complete sale & generate receipt", type="primary", use_container_width=True):
-                receipt, total = create_sale(st.session_state.cart, customer, payment, discount, cashier)
-                st.session_state.cart = []
-                st.session_state.last_receipt = receipt
-                st.success(f"Sale completed: {receipt} · {money(total)}")
-                st.rerun()
+                try:
+                    receipt, total = create_sale(st.session_state.cart, customer, payment, discount, cashier)
+                    st.session_state.cart = []
+                    st.session_state.last_receipt = receipt
+                    st.success(f"Sale completed: {receipt} · {money(total)}")
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
         if st.button("Clear cart"): st.session_state.cart = []; st.rerun()
     else: st.info("Your cart is empty. Add an in-stock product above to begin.")
     if st.session_state.get("last_receipt"):
         receipt = st.session_state.last_receipt
         st.markdown(receipt_html(receipt), unsafe_allow_html=True)
+        st.subheader("Issue receipt")
+        receipt_method = st.radio("Receipt method", ["Print", "Email", "Text message"], horizontal=True, key=f"receipt_method_{receipt}", label_visibility="collapsed")
+        if receipt_method == "Print":
+            PRINT_RECEIPT(data={"document": receipt_print_document(receipt)}, key=f"print_receipt_{receipt}")
+        elif receipt_method == "Email":
+            if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
+                st.info("Email delivery needs SENDGRID_API_KEY and SENDGRID_FROM_EMAIL configured in Render Environment settings.")
+            with st.form(f"send_receipt_email_{receipt}"):
+                destination_email = st.text_input("Recipient email address", key=f"receipt_email_{receipt}")
+                send_email = st.form_submit_button("Send receipt by email", type="primary")
+            if send_email:
+                try:
+                    send_receipt_email(receipt, destination_email)
+                    st.success(f"Receipt sent to {destination_email.strip()}.")
+                except (ValueError, RuntimeError) as error:
+                    st.error(str(error))
+        else:
+            if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
+                st.info("Text delivery needs TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER configured in Render Environment settings.")
+            with st.form(f"send_receipt_sms_{receipt}"):
+                destination_phone = st.text_input("Mobile number (international format)", placeholder="+254712345678", key=f"receipt_phone_{receipt}")
+                send_sms = st.form_submit_button("Send receipt by text", type="primary")
+            if send_sms:
+                try:
+                    send_receipt_sms(receipt, destination_phone)
+                    st.success(f"Receipt sent to {destination_phone.strip()}.")
+                except (ValueError, RuntimeError) as error:
+                    st.error(str(error))
         st.download_button("Download receipt Excel", receipt_excel_bytes(receipt), f"{receipt}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif page == "Inventory & Stock":
@@ -1029,7 +1200,7 @@ elif page == "Inventory & Stock":
     if product_form:
         with product_form:
             supplier_where, supplier_params = pharmacy_scope()
-            supplier_rows = [dict(row) for row in query(f"SELECT id,name FROM suppliers{supplier_where} ORDER BY name", supplier_params)]
+            supplier_rows = load_supplier_options(supplier_where, supplier_params)
             with st.form("new_product"):
                 a, b, c = st.columns(3)
                 with a: code = st.text_input("Product code *"); name = st.text_input("Drug name *"); category = st.text_input("Category", value="Medicine")
@@ -1053,9 +1224,7 @@ elif page == "Daily Sales":
     header("Sales intelligence", "Daily sales log.", "Review every transaction, payment method, cashier, and revenue total.")
     selected_date = st.date_input("Sales date", value=date.today())
     sales_where, sales_params = pharmacy_scope("sales")
-    sales_sql = "SELECT receipt_no, created_at, customer_name, payment_method, subtotal, discount, total, cashier FROM sales"
-    sales_sql += sales_where + (" AND " if sales_where else " WHERE ") + "CAST(created_at AS DATE)=CAST(? AS DATE) ORDER BY created_at DESC"
-    sales = pd.read_sql_query(sql_for_backend(sales_sql), db(), params=sales_params + (selected_date.isoformat(),))
+    sales = load_daily_sales(sales_where, sales_params, selected_date.isoformat())
     st.metric("Revenue", money(sales.total.sum() if not sales.empty else 0)); st.dataframe(sales.rename(columns={"receipt_no":"Receipt","created_at":"Date & time","customer_name":"Customer","payment_method":"Payment","subtotal":"Subtotal","discount":"Discount","total":"Total","cashier":"Cashier"}), use_container_width=True, hide_index=True)
     st.download_button("Export daily sales Excel", dataframe_excel_bytes(sales, "Daily Sales"), f"sales-{selected_date.isoformat()}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -1076,11 +1245,12 @@ elif page == "Suppliers":
     if supplier_form and save_supplier:
         try:
             with db() as connection: connection.execute("INSERT INTO suppliers(name,contact_person,phone,email,lead_time_days,payment_terms,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?)", (supplier_name.strip(),contact,phone,email,lead,terms,now_text(),write_pharmacy_id()))
+            load_supplier_options.clear()
+            load_supplier_directory.clear()
             add_audit("Supplier added", "Suppliers", f"Added {supplier_name.strip()}"); st.success("Supplier added."); st.rerun()
         except sqlite3.IntegrityError: st.error("That supplier already exists.")
     suppliers_where, suppliers_params = pharmacy_scope()
-    suppliers_sql = f"SELECT name,contact_person,phone,email,lead_time_days,payment_terms FROM suppliers{suppliers_where} ORDER BY name"
-    suppliers = pd.read_sql_query(sql_for_backend(suppliers_sql), db(), params=suppliers_params)
+    suppliers = load_supplier_directory(suppliers_where, suppliers_params)
     st.dataframe(suppliers.rename(columns={"name":"Supplier","contact_person":"Contact","phone":"Phone","email":"Email","lead_time_days":"Lead days","payment_terms":"Terms"}), use_container_width=True, hide_index=True)
 
 elif page == "Audit Log":
@@ -1108,6 +1278,7 @@ elif page == "Pharmacies":
                     pharmacy = connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?) RETURNING id", (pharmacy_name.strip(), pharmacy_location.strip(), now_text())).fetchone()
                     pharmacy_id = pharmacy["id"]
                     connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (admin_name.strip(), password_hash(admin_password), "admin", 1, 1, 1, 1, now_text(), pharmacy_id))
+                load_active_pharmacies.clear()
                 st.success(f"Created {pharmacy_name.strip()} with admin {admin_name.strip()}.")
                 st.markdown(f"**Pharmacy login link:** [Open {html.escape(pharmacy_name.strip())} login](?pharmacy={pharmacy_id})")
                 st.caption("Share this link with the pharmacy administrator. They will see this pharmacy name on the login screen.")
