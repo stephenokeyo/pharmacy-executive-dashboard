@@ -4,3 +4,4 @@ psycopg2-binary>=2.9,<3
 firebase-admin>=6.5,<8
 streamlit>=1.57,<2
 streamlit-autorefresh>=1.0.1,<2
+cryptography>=42

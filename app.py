@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover
 
 import pandas as pd
 import streamlit as st
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -58,6 +60,8 @@ TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "")
 SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL", "")
 CURRENCY = "KSh"
+MODULES = ["Dashboard", "Point of Sale", "Daily Sales", "Inventory & Stock", "Suppliers", "Audit Log"]
+LOGO_MAX_BYTES = 300 * 1024
 EAT = ZoneInfo("Africa/Nairobi")
 INVENTORY_EXCEL_COLUMNS = [
     "Product ID", "Product Name", "Supplier Name", "Batch No", "Expiry Date", "Initial Stock",
@@ -419,6 +423,16 @@ def is_super_admin(user: dict) -> bool:
     return str(user.get("role", "")).strip().lower() == "super_admin"
 
 
+def user_modules(user: dict) -> list[str]:
+    if is_admin(user):
+        return list(MODULES)
+    raw = user.get("modules")
+    if raw is None:  # accounts created before module permissions existed
+        return list(MODULES)
+    granted = {item.strip() for item in str(raw).split(",")}
+    return [module for module in MODULES if module in granted]
+
+
 def active_pharmacy_id() -> int | None:
     if "user" not in st.session_state:
         return None
@@ -453,7 +467,7 @@ def login_pharmacy() -> sqlite3.Row | None:
     if not pharmacy_value:
         return None
     try:
-        rows = query("SELECT id,name,location FROM pharmacies WHERE id=? AND active=1", (int(pharmacy_value),))
+        rows = query("SELECT id,name,location,COALESCE(logo,'') AS logo FROM pharmacies WHERE id=? AND active=1", (int(pharmacy_value),))
     except ValueError:
         return None
     return rows[0] if rows else None
@@ -593,6 +607,20 @@ def setup_database_postgres() -> None:
             if not check:
                 connection.execute(f"ALTER TABLE {table} ADD COLUMN pharmacy_id INTEGER")
             connection.execute(f"UPDATE {table} SET pharmacy_id=%s WHERE pharmacy_id IS NULL", (default_pharmacy_id,))
+        connection.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS modules TEXT")
+        connection.execute("ALTER TABLE pharmacies ADD COLUMN IF NOT EXISTS logo TEXT DEFAULT ''")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pharmacy_backups (
+                id SERIAL PRIMARY KEY,
+                pharmacy_id INTEGER,
+                pharmacy_name TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                content TEXT NOT NULL
+            );
+            """
+        )
         setup_firestore_mirror(connection)
         if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             if not BOOTSTRAP_ADMIN_USERNAME or len(BOOTSTRAP_ADMIN_PASSWORD) < 16:
@@ -715,9 +743,9 @@ def load_audit_log(where: str, params: tuple) -> pd.DataFrame:
 
 @st.cache_data(ttl=15, max_entries=64)
 def load_members(where: str, params: tuple) -> pd.DataFrame:
-    sql = f"SELECT username,role,active,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at FROM users{where} ORDER BY username"
+    sql = f"SELECT id,username,role,active,modules,created_at FROM users{where} ORDER BY username"
     rows = [dict(row) for row in query(sql_for_backend(sql), params)]
-    return pd.DataFrame.from_records(rows, columns=["username", "role", "active", "can_manage_inventory", "can_manage_suppliers", "can_view_reports", "can_view_audit", "created_at"])
+    return pd.DataFrame.from_records(rows, columns=["id", "username", "role", "active", "modules", "created_at"])
 
 
 @st.cache_data(ttl=15, max_entries=64)
@@ -1006,7 +1034,7 @@ def create_sale(cart: list[dict], customer: str, payment: str, discount: float, 
 def receipt_data(receipt: str) -> tuple[dict, list[dict]]:
     sale = query(
         "SELECT s.*, COALESCE(NULLIF(p.name,''),'SecureTech Slns') AS pharmacy_name, "
-        "COALESCE(p.location,'') AS pharmacy_location FROM sales s "
+        "COALESCE(p.location,'') AS pharmacy_location, COALESCE(p.logo,'') AS pharmacy_logo FROM sales s "
         "LEFT JOIN pharmacies p ON p.id=s.pharmacy_id WHERE s.receipt_no=?",
         (receipt,),
     )[0]
@@ -1020,7 +1048,8 @@ def receipt_html(receipt: str) -> str:
     pharmacy_name = html.escape(str(sale["pharmacy_name"]))
     pharmacy_location = html.escape(str(sale["pharmacy_location"]))
     location_line = f"<p>{pharmacy_location}</p>" if pharmacy_location else ""
-    return f"""<div class='receipt'><h2>{pharmacy_name}</h2>{location_line}<hr><p><b>Receipt:</b> {html.escape(str(receipt))}<br><b>Date:</b> {html.escape(str(sale['created_at']))}<br><b>Customer:</b> {html.escape(str(sale['customer_name']))}<br><b>Payment:</b> {html.escape(str(sale['payment_method']))}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing {pharmacy_name}.</p></div>"""
+    logo_line = logo_img(sale.get("pharmacy_logo", ""), 80)
+    return f"""<div class='receipt'>{logo_line}<h2>{pharmacy_name}</h2>{location_line}<hr><p><b>Receipt:</b> {html.escape(str(receipt))}<br><b>Date:</b> {html.escape(str(sale['created_at']))}<br><b>Customer:</b> {html.escape(str(sale['customer_name']))}<br><b>Payment:</b> {html.escape(str(sale['payment_method']))}</p><table><tr><th>Item</th><th>Qty</th><th>Total</th></tr>{rows}</table><hr><p class='total'>TOTAL: {money(sale['total'])}</p><p>Thank you for choosing {pharmacy_name}.</p></div>"""
 
 
 def receipt_print_document(receipt: str) -> str:
@@ -1029,7 +1058,15 @@ def receipt_print_document(receipt: str) -> str:
 
 def receipt_plain_text(receipt: str) -> str:
     sale, items = receipt_data(receipt)
-    lines = [str(sale["pharmacy_name"]), str(sale["pharmacy_location"]), f"Receipt: {receipt}", f"Date: {sale['created_at']}", f"Customer: {sale['customer_name']}", f"Payment: {sale['payment_method']}", ""]
+    lines = [
+        str(sale["pharmacy_name"]),
+        str(sale["pharmacy_location"]),
+        f"Receipt: {receipt}",
+        f"Date: {sale['created_at']}",
+        f"Customer: {sale['customer_name']}",
+        f"Payment: {sale['payment_method']}",
+        "",
+    ]
     lines.extend(f"{item['name']} x {item['quantity']:g}: {money(item['line_total'])}" for item in items)
     lines.extend(("", f"Subtotal: {money(sale['subtotal'])}", f"Discount: {money(sale['discount'])}", f"Total: {money(sale['total'])}"))
     return "\n".join(lines)
@@ -1042,10 +1079,16 @@ def send_receipt_sms(receipt: str, phone_number: str) -> None:
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_FROM_NUMBER:
         raise RuntimeError("SMS sending is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER in Render Environment settings.")
     token = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode("utf-8")).decode("ascii")
-    request = Request(f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json", data=urlencode({"To": destination, "From": TWILIO_FROM_NUMBER, "Body": receipt_plain_text(receipt)}).encode("utf-8"), headers={"Authorization": f"Basic {token}", "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    request = Request(
+        f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json",
+        data=urlencode({"To": destination, "From": TWILIO_FROM_NUMBER, "Body": receipt_plain_text(receipt)}).encode("utf-8"),
+        headers={"Authorization": f"Basic {token}", "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
     try:
         with urlopen(request, timeout=20) as response:
-            if response.status not in (200, 201): raise RuntimeError(f"SMS provider returned HTTP {response.status}.")
+            if response.status not in (200, 201):
+                raise RuntimeError(f"SMS provider returned HTTP {response.status}.")
     except HTTPError as error:
         raise RuntimeError(f"SMS provider rejected the request (HTTP {error.code}). Check the Twilio account and sender number.") from None
     except URLError:
@@ -1054,19 +1097,169 @@ def send_receipt_sms(receipt: str, phone_number: str) -> None:
 
 def send_receipt_email(receipt: str, email_address: str) -> None:
     destination = parseaddr(email_address.strip())[1]
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", destination): raise ValueError("Enter a valid email address.")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", destination):
+        raise ValueError("Enter a valid email address.")
     if not SENDGRID_API_KEY or not SENDGRID_FROM_EMAIL:
         raise RuntimeError("Email sending is not configured. Add SENDGRID_API_KEY and SENDGRID_FROM_EMAIL in Render Environment settings.")
     sale, _ = receipt_data(receipt)
-    payload = json.dumps({"personalizations": [{"to": [{"email": destination}]}], "from": {"email": SENDGRID_FROM_EMAIL}, "subject": f"{sale['pharmacy_name']} receipt {receipt}", "content": [{"type": "text/html", "value": receipt_print_document(receipt)}]}).encode("utf-8")
-    request = Request("https://api.sendgrid.com/v3/mail/send", data=payload, headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"}, method="POST")
+    payload = json.dumps({
+        "personalizations": [{"to": [{"email": destination}]}],
+        "from": {"email": SENDGRID_FROM_EMAIL},
+        "subject": f"{sale['pharmacy_name']} receipt {receipt}",
+        "content": [{"type": "text/html", "value": receipt_print_document(receipt)}],
+    }).encode("utf-8")
+    request = Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=payload,
+        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+        method="POST",
+    )
     try:
         with urlopen(request, timeout=20) as response:
-            if response.status != 202: raise RuntimeError(f"Email provider returned HTTP {response.status}.")
+            if response.status != 202:
+                raise RuntimeError(f"Email provider returned HTTP {response.status}.")
     except HTTPError as error:
         raise RuntimeError(f"Email provider rejected the request (HTTP {error.code}). Check the SendGrid account and sender verification.") from None
     except URLError:
         raise RuntimeError("Could not connect to the email provider. Check the server network and try again.") from None
+
+
+def logo_img(data_uri: str, max_height: int) -> str:
+    if not data_uri or not data_uri.startswith(("data:image/png;base64,", "data:image/jpeg;base64,")):
+        return ""
+    return f"<img src='{html.escape(data_uri)}' alt='Pharmacy logo' style='display:block;margin:0 auto 8px;max-height:{max_height}px;max-width:180px;object-fit:contain'>"
+
+
+def logo_data_uri(upload) -> str:
+    content = upload.getvalue()
+    if len(content) > LOGO_MAX_BYTES:
+        raise ValueError("Logo must be 300 KB or smaller.")
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif content.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    else:
+        raise ValueError("Logo must be a PNG or JPG image.")
+    return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+
+
+@st.cache_data(ttl=60, max_entries=64)
+def load_pharmacy_logo(pharmacy_id: int | None) -> str:
+    if pharmacy_id is None:
+        return ""
+    rows = query("SELECT COALESCE(logo,'') AS logo FROM pharmacies WHERE id=?", (pharmacy_id,))
+    return rows[0]["logo"] if rows else ""
+
+
+def save_pharmacy_logo(pharmacy_id: int, data_uri: str) -> None:
+    with db() as connection:
+        connection.execute("UPDATE pharmacies SET logo=? WHERE id=?", (data_uri, pharmacy_id))
+    load_pharmacy_logo.clear()
+    receipt_data.clear()
+    receipt_excel_bytes.clear()
+
+
+def logo_manager(pharmacy_id: int) -> None:
+    current = load_pharmacy_logo(pharmacy_id)
+    if current:
+        st.markdown(logo_img(current, 90), unsafe_allow_html=True)
+    else:
+        st.caption("No logo uploaded yet.")
+    upload = st.file_uploader("Pharmacy logo (PNG or JPG, max 300 KB)", type=["png", "jpg", "jpeg"], key=f"logo_upload_{pharmacy_id}")
+    save_col, remove_col = st.columns(2)
+    if save_col.button("Save logo", type="primary", key=f"logo_save_{pharmacy_id}", disabled=upload is None, use_container_width=True):
+        try:
+            save_pharmacy_logo(pharmacy_id, logo_data_uri(upload))
+            add_audit("Logo updated", "Pharmacy", "Pharmacy logo uploaded", st.session_state.user["username"])
+            st.success("Logo saved.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+    if remove_col.button("Remove logo", key=f"logo_remove_{pharmacy_id}", disabled=not current, use_container_width=True):
+        save_pharmacy_logo(pharmacy_id, "")
+        add_audit("Logo removed", "Pharmacy", "Pharmacy logo removed", st.session_state.user["username"])
+        st.rerun()
+
+
+BACKUP_VIEWER_TEMPLATE = """<!doctype html><html><head><meta charset="utf-8"><title>__TITLE__</title>
+<style>body{font:14px Arial,sans-serif;margin:24px;color:#17282d}h1{margin:0 0 4px}h2{margin-top:28px}table{border-collapse:collapse;width:100%;margin-top:8px}th,td{border:1px solid #ddd;padding:5px 8px;text-align:left;font-size:13px;vertical-align:top}th{background:#eef3f1}input,button{font-size:15px;padding:9px 12px}button{background:#087f75;color:#fff;border:0;border-radius:6px;cursor:pointer}.err{color:#b00020;margin-top:8px}</style></head>
+<body><h1>__TITLE__</h1><p>Encrypted pharmacy backup</p>
+<div id="gate"><input id="pw" type="password" placeholder="Backup password" size="34"> <button id="go">Open backup</button><div class="err" id="msg"></div></div><div id="out"></div>
+<script>
+const B = __BLOB__;
+const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+const chromeOnly = brands.some(b => b.brand === "Google Chrome") && !brands.some(b => b.brand === "Microsoft Edge" || b.brand === "Opera");
+const msg = document.getElementById("msg");
+if (!chromeOnly) { document.getElementById("gate").innerHTML = "<div class='err'>This backup can only be opened in Google Chrome.</div>"; }
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+function table(rows) {
+  const t = document.createElement("table");
+  if (!rows.length) { t.appendChild(document.createElement("tr")).appendChild(document.createElement("td")).textContent = "No records"; return t; }
+  const cols = Object.keys(rows[0]);
+  const head = t.appendChild(document.createElement("tr"));
+  cols.forEach(c => { head.appendChild(document.createElement("th")).textContent = c; });
+  rows.forEach(r => { const tr = t.appendChild(document.createElement("tr")); cols.forEach(c => { tr.appendChild(document.createElement("td")).textContent = r[c] === null ? "" : String(r[c]); }); });
+  return t;
+}
+function render(data) {
+  const out = document.getElementById("out");
+  document.getElementById("gate").style.display = "none";
+  Object.keys(data).forEach(k => {
+    out.appendChild(document.createElement("h2")).textContent = k;
+    out.appendChild(table(Array.isArray(data[k]) ? data[k] : [data[k]]));
+  });
+}
+async function openBackup() {
+  msg.textContent = "";
+  try {
+    const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(document.getElementById("pw").value), "PBKDF2", false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey({name: "PBKDF2", salt: b64(B.salt), iterations: B.iter, hash: "SHA-256"}, km, {name: "AES-GCM", length: 256}, false, ["decrypt"]);
+    const pt = await crypto.subtle.decrypt({name: "AES-GCM", iv: b64(B.iv)}, key, b64(B.data));
+    render(JSON.parse(new TextDecoder().decode(pt)));
+  } catch (e) { msg.textContent = "Wrong password or damaged file."; }
+}
+document.getElementById("go") && document.getElementById("go").addEventListener("click", openBackup);
+document.getElementById("pw") && document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") openBackup(); });
+</script></body></html>"""
+
+
+def build_pharmacy_backup(pharmacy_id: int) -> tuple[str, str, str]:
+    """Return (pharmacy_name, encrypted viewer HTML, generated password)."""
+    def rows(sql: str) -> list[dict]:
+        return [dict(row) for row in query(sql, (pharmacy_id,))]
+
+    pharmacy = rows("SELECT id,name,location,active,created_at FROM pharmacies WHERE id=?")
+    if not pharmacy:
+        raise ValueError("Pharmacy no longer exists.")
+    payload = {
+        "Pharmacy": pharmacy,
+        "Products": rows("SELECT * FROM products WHERE pharmacy_id=? ORDER BY name"),
+        "Suppliers": rows("SELECT * FROM suppliers WHERE pharmacy_id=? ORDER BY name"),
+        "Sales": rows("SELECT * FROM sales WHERE pharmacy_id=? ORDER BY id"),
+        "Sale items": rows("SELECT si.* FROM sale_items si JOIN sales s ON s.id=si.sale_id WHERE s.pharmacy_id=? ORDER BY si.id"),
+        "Audit log": rows("SELECT * FROM audit_log WHERE pharmacy_id=? ORDER BY id"),
+        "Users": rows("SELECT id,username,role,active,modules,created_at FROM users WHERE pharmacy_id=? ORDER BY username"),
+    }
+    password = secrets.token_urlsafe(18)
+    salt, iv = secrets.token_bytes(16), secrets.token_bytes(12)
+    iterations = 200_000
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
+    ciphertext = AESGCM(key).encrypt(iv, json.dumps(payload, default=str).encode("utf-8"), None)
+    blob = {"salt": base64.b64encode(salt).decode(), "iv": base64.b64encode(iv).decode(), "iter": iterations, "data": base64.b64encode(ciphertext).decode()}
+    name = pharmacy[0]["name"]
+    document = BACKUP_VIEWER_TEMPLATE.replace("__TITLE__", html.escape(f"{name} backup")).replace("__BLOB__", json.dumps(blob))
+    return name, document, password
+
+
+def delete_pharmacy(pharmacy_id: int) -> None:
+    with db() as connection:
+        connection.execute("DELETE FROM sale_items WHERE sale_id IN (SELECT id FROM sales WHERE pharmacy_id=?)", (pharmacy_id,))
+        for table in ("sales", "products", "suppliers", "audit_log", "users"):
+            connection.execute(f"DELETE FROM {table} WHERE pharmacy_id=?", (pharmacy_id,))
+        connection.execute("DELETE FROM pharmacies WHERE id=?", (pharmacy_id,))
+    for cached in (load_active_pharmacies, load_pharmacy_directory, load_pharmacy_logo, load_products_for_scope, load_supplier_options,
+                   load_supplier_directory, load_audit_log, load_members, load_dashboard_sales, load_daily_sales, receipt_data, receipt_excel_bytes):
+        cached.clear()
 
 
 firebase_firestore_client()
@@ -1076,6 +1269,10 @@ schedule_firebase_sync()
 if "user" not in st.session_state:
     requested_pharmacy = login_pharmacy()
     login_name = requested_pharmacy["name"] if requested_pharmacy else "SecureTech Slns"
+    if requested_pharmacy and requested_pharmacy["logo"]:
+        st.markdown(logo_img(requested_pharmacy["logo"], 100), unsafe_allow_html=True)
+    elif requested_pharmacy:
+        st.caption("This pharmacy has not uploaded its logo yet.")
     st.markdown(f"<div class='hero'><div class='section-kicker' style='color:#9ce3ca'>Secure pharmacy operations</div><h1>Welcome to {html.escape(login_name)}.</h1><p>Sign in to manage stock, sales, suppliers, and reports.</p></div>", unsafe_allow_html=True)
     with st.form("login_form"):
         username = st.text_input("Username")
@@ -1114,13 +1311,22 @@ h1,h2,h3 { font-family:'Space Grotesk',sans-serif; letter-spacing:0; }
 
 
 with st.sidebar:
-    st.markdown("<div class='brand'><small>Pharmacy operations</small><h2>SECURE TECH SOLUTIONS</h2></div>", unsafe_allow_html=True)
-    allowed_pages = ["Dashboard", "Point of Sale", "Daily Sales", "Inventory & Stock", "Suppliers", "Audit Log"]
+    sidebar_logo = logo_img(load_pharmacy_logo(write_pharmacy_id()), 70)
+    st.markdown(f"<div class='brand'>{sidebar_logo}<small>Pharmacy operations</small><h2>SECURE TECH SOLUTIONS</h2></div>", unsafe_allow_html=True)
+    allowed_pages = user_modules(current_user)
+    if not allowed_pages and not admin_access:
+        st.warning("No modules have been assigned to your account. Ask the super admin for access.")
+        if st.button("Sign out", use_container_width=True):
+            del st.session_state["user"]
+            st.rerun()
+        st.stop()
     if admin_access:
-        allowed_pages.append("Members")
+        allowed_pages.extend(["Members", "Pharmacy Logo"])
     if is_super_admin(current_user):
-        allowed_pages.append("Pharmacies")
-    page = st.radio("Navigate", allowed_pages, label_visibility="collapsed")
+        allowed_pages.extend(["Pharmacies", "Backups"])
+    if st.session_state.get("nav_page") not in allowed_pages:
+        st.session_state.pop("nav_page", None)
+    page = st.radio("Navigate", allowed_pages, label_visibility="collapsed", key="nav_page")
     if page == "Dashboard":
         st_autorefresh(interval=60000, limit=None, key="dashboard_refresh")
     st.divider()
@@ -1128,6 +1334,7 @@ with st.sidebar:
         pharmacy_options = load_active_pharmacies()
         selected_name = st.selectbox("Manage pharmacy", [row["name"] for row in pharmacy_options], index=next((index for index, row in enumerate(pharmacy_options) if row["id"] == st.session_state.selected_pharmacy_id), 0))
         st.session_state.selected_pharmacy_id = next(row["id"] for row in pharmacy_options if row["name"] == selected_name)
+        st.button("Open pharmacy settings", use_container_width=True, on_click=lambda: st.session_state.update(nav_page="Pharmacies"))
     pharmacy_label = "All pharmacies" if is_super_admin(current_user) else current_user.get("pharmacy_name", "Assigned pharmacy")
     st.caption(f"Signed in: {current_user['username']} · {current_user['role'].replace('_', ' ').title()}")
     st.caption(f"Scope: {pharmacy_label}")
@@ -1140,6 +1347,12 @@ with st.sidebar:
 def header(kicker: str, title: str, subtitle: str) -> None:
     st.markdown(f"<div class='hero'><div class='section-kicker' style='color:#9ce3ca'>{kicker}</div><h1>{title}</h1><p>{subtitle}</p></div>", unsafe_allow_html=True)
 
+
+if not is_super_admin(current_user) and admin_access and not load_pharmacy_logo(active_pharmacy_id()):
+    header("Branding", "Upload your pharmacy logo.", "A logo is required before you can continue. It appears on the login page, sidebar and receipts.")
+    st.error("Pharmacy logo is required.")
+    logo_manager(active_pharmacy_id())
+    st.stop()
 
 if page == "Dashboard":
     products = load_products()
@@ -1169,6 +1382,9 @@ if page == "Dashboard":
     with chart_b:
         counts = products.apply(lambda row: status(row.current_stock, row.reorder_level), axis=1).value_counts()
         st.bar_chart(counts, height=260)
+    if admin_access and write_pharmacy_id() is not None:
+        with st.expander("Pharmacy logo"):
+            logo_manager(write_pharmacy_id())
 
 elif page == "Point of Sale":
     products = load_products()
@@ -1294,8 +1510,44 @@ elif page == "Inventory & Stock":
                     if not code.strip() or not name.strip(): raise ValueError("Product code and drug name are required.")
                     add_product({"code":code.strip(),"name":name.strip(),"category":category.strip() or "Medicine","supplier_id":supplier["id"],"batch":batch.strip() or "N/A","expiry":expiry.isoformat(),"stock":stock,"reorder":reorder,"cost":cost,"price":price})
                     st.success(f"Added {name.strip()} to inventory."); st.rerun()
-                except sqlite3.IntegrityError: st.error("That product code already exists.")
+                except (sqlite3.IntegrityError, psycopg2.IntegrityError): st.error("That product code already exists.")
                 except ValueError as error: st.error(str(error))
+    if admin_access and not products.empty:
+        with st.expander("Adjust or edit stock", expanded=True):
+            product_lookup = {int(row.id): row for row in products.itertuples()}
+            edit_id = st.selectbox("Product", list(product_lookup), format_func=lambda pid: f"{product_lookup[pid].product_code} · {product_lookup[pid].name} · {product_lookup[pid].current_stock:g} in stock")
+            current = product_lookup[edit_id]
+            try:
+                current_expiry = datetime.strptime(str(current.expiry_date), "%Y-%m-%d").date()
+            except ValueError:
+                current_expiry = date.today()
+            with st.form(f"edit_product_{edit_id}"):
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    new_name = st.text_input("Drug name *", value=current.name)
+                    new_batch = st.text_input("Batch number", value=current.batch_no or "N/A")
+                    new_expiry = st.date_input("Expiry date", value=current_expiry)
+                with e2:
+                    new_stock = st.number_input("Current stock", min_value=0.0, step=1.0, value=float(current.current_stock))
+                    new_reorder = st.number_input("Reorder level", min_value=0.0, step=1.0, value=float(current.reorder_level))
+                    reason = st.text_input("Reason for adjustment")
+                with e3:
+                    new_cost = st.number_input("Unit cost (KSh)", min_value=0.0, step=1.0, value=float(current.unit_cost))
+                    new_price = st.number_input("Selling price (KSh)", min_value=0.0, step=1.0, value=float(current.selling_price))
+                save_edit = st.form_submit_button("Save changes", type="primary")
+            if save_edit:
+                if not new_name.strip():
+                    st.error("Drug name is required.")
+                else:
+                    with db() as connection:
+                        connection.execute(
+                            "UPDATE products SET name=?,batch_no=?,expiry_date=?,current_stock=?,reorder_level=?,unit_cost=?,selling_price=?,updated_at=? WHERE id=? AND pharmacy_id=?",
+                            (new_name.strip(), new_batch.strip() or "N/A", new_expiry.isoformat(), new_stock, new_reorder, new_cost, new_price, now_text(), edit_id, write_pharmacy_id()),
+                        )
+                    add_audit("Stock adjusted", "Inventory", f"{current.product_code} - {new_name.strip()}: stock {current.current_stock:g} -> {new_stock:g}. Reason: {reason.strip() or 'n/a'}", current_user["username"])
+                    load_products_for_scope.clear()
+                    st.success("Product updated.")
+                    st.rerun()
     view = products.copy(); view["Status"] = view.apply(lambda row: status(row.current_stock, row.reorder_level), axis=1); view["Expiry"] = view.expiry_date.apply(expiry_status)
     filter_status = st.multiselect("Filter status", ["OK", "LOW STOCK", "OUT OF STOCK", "EXPIRED", "EXPIRING SOON"])
     if filter_status: view = view[view.Status.isin(filter_status) | view.Expiry.isin(filter_status)]
@@ -1330,7 +1582,7 @@ elif page == "Suppliers":
             load_supplier_options.clear()
             load_supplier_directory.clear()
             add_audit("Supplier added", "Suppliers", f"Added {supplier_name.strip()}"); st.success("Supplier added."); st.rerun()
-        except sqlite3.IntegrityError: st.error("That supplier already exists.")
+        except (sqlite3.IntegrityError, psycopg2.IntegrityError): st.error("That supplier already exists.")
     suppliers_where, suppliers_params = pharmacy_scope()
     suppliers = load_supplier_directory(suppliers_where, suppliers_params)
     st.dataframe(suppliers.rename(columns={"name":"Supplier","contact_person":"Contact","phone":"Phone","email":"Email","lead_time_days":"Lead days","payment_terms":"Terms"}), use_container_width=True, hide_index=True)
@@ -1347,16 +1599,24 @@ elif page == "Pharmacies":
     with st.form("new_pharmacy"):
         pharmacy_name = st.text_input("Pharmacy name *")
         pharmacy_location = st.text_input("Location")
+        pharmacy_logo_upload = st.file_uploader("Pharmacy logo * (PNG or JPG, max 300 KB)", type=["png", "jpg", "jpeg"])
         admin_name = st.text_input("Pharmacy admin username *")
         admin_password = st.text_input("Pharmacy admin temporary password *", type="password")
         create_pharmacy = st.form_submit_button("Create pharmacy system", type="primary")
     if create_pharmacy:
         if not pharmacy_name.strip() or not admin_name.strip() or not admin_password:
             st.error("Pharmacy name, admin username, and password are required.")
+        elif pharmacy_logo_upload is None:
+            st.error("A pharmacy logo is required.")
         else:
             try:
+                new_logo = logo_data_uri(pharmacy_logo_upload)
+            except ValueError as error:
+                st.error(str(error))
+                st.stop()
+            try:
                 with db() as connection:
-                    pharmacy = connection.execute("INSERT INTO pharmacies(name,location,created_at) VALUES(?,?,?) RETURNING id", (pharmacy_name.strip(), pharmacy_location.strip(), now_text())).fetchone()
+                    pharmacy = connection.execute("INSERT INTO pharmacies(name,location,logo,created_at) VALUES(?,?,?,?) RETURNING id", (pharmacy_name.strip(), pharmacy_location.strip(), new_logo, now_text())).fetchone()
                     pharmacy_id = pharmacy["id"]
                     connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (admin_name.strip(), password_hash(admin_password), "admin", 1, 1, 1, 1, now_text(), pharmacy_id))
                 load_active_pharmacies.clear()
@@ -1364,13 +1624,114 @@ elif page == "Pharmacies":
                 st.success(f"Created {pharmacy_name.strip()} with admin {admin_name.strip()}.")
                 st.markdown(f"**Pharmacy login link:** [Open {html.escape(pharmacy_name.strip())} login](?pharmacy={pharmacy_id})")
                 st.caption("Share this link with the pharmacy administrator. They will see this pharmacy name on the login screen.")
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, psycopg2.IntegrityError):
                 st.error("The pharmacy name or admin username already exists.")
     pharmacies = load_pharmacy_directory()
     st.dataframe(pharmacies.drop(columns=["id"]).rename(columns={"name":"Pharmacy","location":"Location","active":"Active","created_at":"Created"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Manage pharmacy")
+    if not pharmacies.empty:
+        records = list(pharmacies.itertuples())
+        current_index = next((i for i, row in enumerate(records) if row.id == st.session_state.get("selected_pharmacy_id")), 0)
+        target = st.selectbox("Pharmacy", records, index=current_index, format_func=lambda row: row.name)
+        target_id = int(target.id)
+        if st.session_state.get("selected_pharmacy_id") != target_id and target.active:
+            st.session_state.selected_pharmacy_id = target_id
+            st.rerun()
+        counts = query(
+            "SELECT (SELECT COUNT(*) FROM products WHERE pharmacy_id=?) AS products, (SELECT COUNT(*) FROM users WHERE pharmacy_id=?) AS users, "
+            "(SELECT COUNT(*) FROM sales WHERE pharmacy_id=?) AS sales", (target_id, target_id, target_id))[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Products", counts["products"]); m2.metric("Users", counts["users"]); m3.metric("Sales", counts["sales"])
+        details_tab, logo_tab, users_tab = st.tabs(["Details", "Logo", "Users"])
+        with details_tab:
+            with st.form(f"edit_pharmacy_{target_id}"):
+                edit_name = st.text_input("Pharmacy name *", value=target.name)
+                edit_location = st.text_input("Location", value=target.location or "")
+                edit_active = st.checkbox("Active (users can sign in)", value=bool(target.active))
+                save_pharmacy = st.form_submit_button("Save pharmacy", type="primary")
+            if save_pharmacy:
+                if not edit_name.strip():
+                    st.error("Pharmacy name is required.")
+                else:
+                    try:
+                        with db() as connection:
+                            connection.execute("UPDATE pharmacies SET name=?,location=?,active=? WHERE id=?", (edit_name.strip(), edit_location.strip(), int(edit_active), target_id))
+                        load_active_pharmacies.clear()
+                        load_pharmacy_directory.clear()
+                        receipt_data.clear()
+                        add_audit("Pharmacy updated", "Pharmacy", f"Updated {edit_name.strip()}", current_user["username"])
+                        st.success("Pharmacy updated.")
+                        st.rerun()
+                    except (sqlite3.IntegrityError, psycopg2.IntegrityError):
+                        st.error("Another pharmacy already uses that name.")
+            st.markdown(f"Login link: [Open {html.escape(target.name)} login](?pharmacy={target_id})")
+        with logo_tab:
+            logo_manager(target_id)
+        with users_tab:
+            pharmacy_users = query("SELECT username,role,active,modules FROM users WHERE pharmacy_id=? ORDER BY username", (target_id,))
+            st.dataframe(pd.DataFrame([dict(row) for row in pharmacy_users], columns=["username", "role", "active", "modules"]), use_container_width=True, hide_index=True)
+            st.caption("Use the Members page to add users, grant modules, or reset passwords for the selected pharmacy.")
     st.markdown("#### Pharmacy login links")
     for pharmacy in pharmacies.itertuples():
         st.markdown(f"- [{html.escape(pharmacy.name)} login](?pharmacy={pharmacy.id})")
+
+elif page == "Backups":
+    header("Data protection", "Backups and deletion.", "Create a password-protected backup of a pharmacy before removing it from the system.")
+    backup_pharmacies = list(load_pharmacy_directory().itertuples())
+    if not backup_pharmacies:
+        st.info("No pharmacies available.")
+    else:
+        backup_default = next((i for i, row in enumerate(backup_pharmacies) if row.id == st.session_state.get("selected_pharmacy_id")), 0)
+        backup_target = st.selectbox("Pharmacy", backup_pharmacies, index=backup_default, format_func=lambda row: row.name, key="backup_target")
+        st.markdown("#### Back up pharmacy data")
+        st.caption("The backup is an encrypted file that opens only in Google Chrome and needs the generated password. The password is shown once and is not stored.")
+        if st.button("Create encrypted backup", type="primary"):
+            try:
+                backup_name, backup_document, backup_password = build_pharmacy_backup(int(backup_target.id))
+                with db() as connection:
+                    connection.execute("INSERT INTO pharmacy_backups(pharmacy_id,pharmacy_name,created_by,created_at,content) VALUES(?,?,?,?,?)", (int(backup_target.id), backup_name, current_user["username"], now_text(), backup_document))
+                st.session_state.new_backup_password = (backup_name, backup_password)
+                st.success(f"Backup of {backup_name} created.")
+            except ValueError as error:
+                st.error(str(error))
+        if st.session_state.get("new_backup_password"):
+            password_owner, generated_password = st.session_state.new_backup_password
+            st.warning(f"Backup password for {password_owner}. Copy it now; it cannot be shown again.")
+            st.code(generated_password, language=None)
+            if st.button("I have saved the password"):
+                del st.session_state["new_backup_password"]
+                st.rerun()
+        st.markdown("#### Saved backups")
+        saved_backups = query("SELECT id,pharmacy_id,pharmacy_name,created_by,created_at FROM pharmacy_backups ORDER BY id DESC")
+        if saved_backups:
+            st.dataframe(pd.DataFrame([dict(row) for row in saved_backups]).drop(columns=["id", "pharmacy_id"]).rename(columns={"pharmacy_name": "Pharmacy", "created_by": "Created by", "created_at": "Created"}), use_container_width=True, hide_index=True)
+            chosen_backup = st.selectbox("Backup file", saved_backups, format_func=lambda row: f"{row['pharmacy_name']} · {row['created_at']}")
+            backup_content = query("SELECT content FROM pharmacy_backups WHERE id=?", (chosen_backup["id"],))[0]["content"]
+            safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", chosen_backup["pharmacy_name"])
+            st.download_button("Download backup (open in Chrome)", backup_content, f"{safe_name}_backup_{chosen_backup['id']}.html", "text/html")
+        else:
+            st.info("No backups yet.")
+        st.markdown("#### Delete pharmacy")
+        target_backups = query("SELECT COUNT(*) AS n FROM pharmacy_backups WHERE pharmacy_id=?", (int(backup_target.id),))[0]["n"]
+        if len(backup_pharmacies) <= 1:
+            st.info("The last remaining pharmacy cannot be deleted.")
+        elif target_backups == 0:
+            st.info("Create a backup of this pharmacy before it can be deleted.")
+        else:
+            st.error(f"Deleting {backup_target.name} permanently removes its products, suppliers, sales, audit log and users.")
+            confirm_name = st.text_input("Type the pharmacy name to confirm", key=f"confirm_delete_{backup_target.id}")
+            if st.button("Delete pharmacy permanently", disabled=confirm_name.strip() != backup_target.name):
+                st.session_state.selected_pharmacy_id = None
+                delete_pharmacy(int(backup_target.id))
+                add_audit("Pharmacy deleted", "Pharmacy", f"Deleted {backup_target.name} after backup", current_user["username"])
+                st.rerun()
+
+elif page == "Pharmacy Logo":
+    header("Branding", "Pharmacy logo.", "Upload the logo shown on this pharmacy's pages and printed receipts.")
+    if write_pharmacy_id() is None:
+        st.info("Select a pharmacy first.")
+    else:
+        logo_manager(write_pharmacy_id())
 
 elif page == "Members":
     header("Access control", "Team members.", "Create accounts and manage passwords within the current pharmacy scope.")
@@ -1380,11 +1741,15 @@ elif page == "Members":
             member_name = st.text_input("Member username *")
             member_password = st.text_input("Temporary password *", type="password")
         with member_right:
-            st.info("Members can view all operational pages and sell, but cannot add/import/update/delete products or change suppliers.")
+            if is_super_admin(current_user):
+                member_modules = st.multiselect("Modules this member can view", MODULES, default=["Point of Sale"])
+            else:
+                st.info("Only the super admin can grant module access. The new member will see nothing until access is granted.")
+                member_modules = []
             manage_inventory = False
             manage_suppliers = False
-            view_reports = True
-            view_audit = True
+            view_reports = False
+            view_audit = False
         create_member = st.form_submit_button("Create member", type="primary")
     if create_member:
         if not member_name.strip() or not member_password:
@@ -1392,15 +1757,33 @@ elif page == "Members":
         else:
             try:
                 with db() as connection:
-                    connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?)", (member_name.strip(), password_hash(member_password), "member", int(manage_inventory), int(manage_suppliers), int(view_reports), int(view_audit), now_text(), write_pharmacy_id()))
+                    connection.execute("INSERT INTO users(username,password_hash,role,can_manage_inventory,can_manage_suppliers,can_view_reports,can_view_audit,modules,created_at,pharmacy_id) VALUES(?,?,?,?,?,?,?,?,?,?)", (member_name.strip(), password_hash(member_password), "member", int(manage_inventory), int(manage_suppliers), int(view_reports), int(view_audit), ",".join(member_modules), now_text(), write_pharmacy_id()))
                 load_members.clear()
                 add_audit("Member added", "Users", f"Created member account {member_name.strip()}", current_user["username"])
                 st.success(f"Member {member_name.strip()} created."); st.rerun()
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, psycopg2.IntegrityError):
                 st.error("That username already exists.")
     members_where, members_params = pharmacy_scope()
     members = load_members(members_where, members_params)
-    st.dataframe(members.rename(columns={"username":"Username","role":"Role","active":"Active","can_manage_inventory":"Inventory rights","can_manage_suppliers":"Supplier rights","can_view_reports":"Report rights","can_view_audit":"Audit rights","created_at":"Created"}), use_container_width=True, hide_index=True)
+    st.dataframe(members.drop(columns=["id"]).rename(columns={"username":"Username","role":"Role","active":"Active","modules":"Modules","created_at":"Created"}), use_container_width=True, hide_index=True)
+    if is_super_admin(current_user):
+        st.markdown("#### Module access")
+        member_rows = [row for row in members.itertuples() if row.role == "member"]
+        if member_rows:
+            access_target = st.selectbox("Member", member_rows, format_func=lambda row: row.username, key="access_target")
+            granted_now = [m for m in MODULES if access_target.modules is None or m in str(access_target.modules).split(",")]
+            with st.form(f"module_access_{access_target.id}"):
+                new_modules = st.multiselect("Modules this member can view", MODULES, default=granted_now)
+                save_access = st.form_submit_button("Save access", type="primary")
+            if save_access:
+                with db() as connection:
+                    connection.execute("UPDATE users SET modules=? WHERE id=? AND role='member'", (",".join(new_modules), int(access_target.id)))
+                load_members.clear()
+                add_audit("Module access changed", "Users", f"{access_target.username}: {', '.join(new_modules) or 'none'}", current_user["username"])
+                st.success("Access updated. The member sees the change at next sign-in.")
+                st.rerun()
+        else:
+            st.info("No member accounts in this scope.")
     st.markdown("#### Reset a user password")
     reset_where, reset_params = pharmacy_scope("u")
     reset_users = query(f"SELECT u.id, u.username, u.role FROM users u{reset_where} ORDER BY u.username", reset_params)
